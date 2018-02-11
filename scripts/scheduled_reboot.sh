@@ -13,6 +13,8 @@ fi
 mode=$(redis-cli get mode)
 
 if [ "$mode" == "dhcp" ]; then
+  touch /home/pi/.firewalla/managed_reboot
+  sync
   /home/pi/firewalla/scripts/firelog -t cloud -m "FIREWALLA.REBOOT SCHEDULED REBOOT IS DISABLED FOR DHCP MODE"
   exit 0
 fi 

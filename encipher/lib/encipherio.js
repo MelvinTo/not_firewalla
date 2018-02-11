@@ -18,7 +18,7 @@ let ursa = require('ursa');
 let crypto = require('crypto');
 let fs = require('fs');
 let path = require('path');
-let request = require('request');
+let request = require('requestretry');
 let uuid = require("uuid");
 let io2 = require('socket.io-client');
 
@@ -278,6 +278,7 @@ let legoEptCloud = class {
         //log("Assertion"+JSON.stringify(assertion));
         let options = {
             uri: this.endpoint + '/login/eptoken',
+            family: 4,
             method: 'POST',
 
             json: assertion
@@ -363,6 +364,7 @@ let legoEptCloud = class {
 
         let options = {
             uri: this.endpoint + '/group/' + this.appId,
+            family: 4,
             method: 'POST',
             auth: {
                 bearer: this.token
@@ -398,6 +400,7 @@ let legoEptCloud = class {
     eptFind(eid, callback) {
         let options = {
             uri: this.endpoint + '/ept/' + encodeURIComponent(eid),
+            family: 4,
             method: 'GET',
             auth: {
                 bearer: this.token
@@ -429,6 +432,7 @@ let legoEptCloud = class {
     eptGroupList(eid, callback) {
         let options = {
             uri: this.endpoint + '/ept/' + encodeURIComponent(eid) + '/groups',
+            family: 4,
             method: 'GET',
             auth: {
                 bearer: this.token
@@ -473,6 +477,7 @@ let legoEptCloud = class {
    rendezvousMap (rid, callback) {
         let options = {
             uri: this.endpoint + '/ept/rendezvous/' + rid,
+            family: 4,
             method: 'GET',
             auth: {
                 bearer: this.token
@@ -506,6 +511,7 @@ let legoEptCloud = class {
         }
         let options = {
             uri: this.endpoint + '/group/' + this.appId + "/" + gid,
+            family: 4,
             method: 'GET',
             auth: {
                 bearer: this.token
@@ -742,6 +748,7 @@ let legoEptCloud = class {
       // log.info('encrypted text ', crypted);
       let options = {
         uri: self.endpoint + '/service/message/' + self.appId + '/' + gid + '/eptgroup/' + gid,
+        family: 4,
         method: 'POST',
         auth: {
           bearer: self.token
@@ -753,7 +760,9 @@ let legoEptCloud = class {
           'mtype': mtype,
           'fid': fid,
           'mid': mid,
-        }
+        },
+        maxAttempts: 5,   // (default) try 5 times
+        retryDelay: 1000,  // (default) wait for 1s before trying again
       };
 
       request(options, (err2, httpResponse, body) => {
@@ -761,7 +770,7 @@ let legoEptCloud = class {
           let stack = new Error().stack;
           log.error("Error while requesting ", err2, stack);
           if(ttl > 1) {
-            _send(gid, msgstr, _beep, mtype, fid, mid, ttl - 1, callback)
+            this._send(gid, msgstr, _beep, mtype, fid, mid, ttl - 1, callback)
           } else {
             callback(err2, null);
           }
@@ -855,6 +864,7 @@ let legoEptCloud = class {
 
             let options = {
                 uri: self.endpoint + '/service/message/' + self.appId + "/" + gid + '/eptgroup/' + encodeURIComponent(self.eid) + '?count=' + count + '&peerId=' + gid + '&since=' + timestamp,
+                family: 4,
                 method: 'GET',
                 auth: {
                     bearer: self.token
@@ -1220,6 +1230,7 @@ let legoEptCloud = class {
                                 if (peerKey != null) {
                                     let options = {
                                         uri: self.endpoint + '/group/' + self.appId + "/" + grp._id + "/" + encodeURIComponent(eid),
+                                        family: 4,
                                         method: 'POST',
                                         auth: {
                                             bearer: self.token
@@ -1284,6 +1295,7 @@ let legoEptCloud = class {
     getStorage(gid, size, expires, callback) {
         let options = {
             uri: this.endpoint + '/service/message/storage/' + gid + '?size=' + size + '&expires=' + expires,
+            family: 4,
             method: 'GET',
             auth: {
                 bearer: this.token
@@ -1324,7 +1336,8 @@ let legoEptCloud = class {
                 request({
                         method: 'PUT',
                         url: url,
-                        body: crypted
+                        body: crypted,
+                        family: 4
                     },
                     function (error, response, body) {
                         if (response.statusCode === 200) {

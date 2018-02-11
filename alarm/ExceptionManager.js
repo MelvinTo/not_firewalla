@@ -7,6 +7,8 @@ const await = require('asyncawait/await');
 
 const Promise = require('bluebird');
 
+const minimatch = require('minimatch')
+
 let Exception = require('./Exception.js');
 let Bone = require('../lib/Bone.js');
 
@@ -207,9 +209,8 @@ module.exports = class {
         });
       });
 
+      // ignore is set for backward compatibility, it's actually should be called "allow"
       Bone.submitIntelFeedback('ignore', exception, 'exception');
-
-      callback(err);
     });
   }
 
@@ -232,7 +233,7 @@ module.exports = class {
       .then((exists) => {
         if(!exists) {
           log.error("exception " + exceptionID + " doesn't exists");
-          return Promise.reject("exception " + exceptionID + " doesn't exists");
+          return Promise.resolve();
         }
 
         return new Promise((resolve, reject) => {
@@ -258,6 +259,7 @@ module.exports = class {
 
             });
 
+            // unignore is set for backward compatibility, it's actually should be called "unallow"
             Bone.submitIntelFeedback('unignore', exception, "exception");
 
             resolve();
@@ -268,7 +270,26 @@ module.exports = class {
       });
   }
 
+  isFirewallaCloud(alarm) {
+    const name = alarm["p.dest.name"]
+    if(!name) {
+      return false
+    }
+
+    return name === "firewalla.encipher.io" ||
+      name === "firewalla.com" ||
+      minimatch(name, "*.firewalla.com")
+
+    // TODO: might need to add static ip address here
+  }
+
   match(alarm, callback) {
+
+    if(this.isFirewallaCloud(alarm)) {
+      callback(null, true, [])
+      return
+    }
+
     this.loadExceptions((err, results) => {
       if(err) {
         callback(err);

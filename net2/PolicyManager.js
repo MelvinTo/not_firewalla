@@ -30,12 +30,10 @@ var CronJob = require('cron').CronJob;
 var async = require('async');
 
 var VpnManager = require('../vpn/VpnManager.js');
-var vpnManager = new VpnManager('info');
 
 const extensionManager = require('../sensor/ExtensionManager.js')
 
 let UPNP = require('../extension/upnp/upnp');
-let upnp = new UPNP();
 
 let DNSMASQ = require('../extension/dnsmasq/dnsmasq.js');
 let dnsmasq = new DNSMASQ();
@@ -248,15 +246,6 @@ module.exports = class {
       }); 
   }
 
-  adblockDnsAddr(callback) {
-      firewalla.getBoneInfo((err,data)=>{
-          if (data && data.config && data.config.dns && data.config.dns.adblock) {
-              callback(null, data.config.dns.adblock);
-          } else {
-              callback(null, ADBLOCK_DNS);
-          }
-      }); 
-  }
 
   family(ip, state, callback) {
     callback = callback || function() {}
@@ -285,17 +274,22 @@ module.exports = class {
       callback(null)
       return
     }
-    
-    this.adblockDnsAddr((err,dnsaddrs)=>{
-      log.info("PolicyManager:Adblock:IPTABLE", ip, state,dnsaddrs.join(" "));
-      if (state == true) {
-        dnsmasq.setDefaultNameServers("adblock", dnsaddrs);
-        dnsmasq.updateResolvConf(callback);
-      } else {
-        dnsmasq.unsetDefaultNameServers("adblock");
-        dnsmasq.updateResolvConf(callback);
-      }
-    });
+
+    log.info("PolicyManager:Adblock:Dnsmasq", ip, state);
+    if (state === true) {
+      dnsmasq.updateAdblockFilter(true, (err) => {
+        if (err) {
+          log.error("Update Adblock filters Failed!", err, {});
+        } else {
+          dnsmasq.reload();
+          log.info("Update Adblock filters successful.");
+        }
+      });
+    } else {
+      dnsmasq.cleanUpAdblockFilter()
+        .then(() => dnsmasq.reload())
+        .catch(err => log.error('Error when clean up adblock filters', err, {}));
+    }
   }
 
     hblock(host, state) {
@@ -329,6 +323,7 @@ module.exports = class {
     }
 
     vpn(host, config, policies) {
+        let vpnManager = new VpnManager('info');
         if (policies.vpnAvaliable == null || policies.vpnAvaliable == false) {
             vpnManager.stop();
             log.error("PolicyManager:VPN", "VPN Not avaliable");
@@ -440,6 +435,7 @@ module.exports = class {
         return; // exit if the flag is still off
       }
       
+      let upnp = new UPNP();
       upnp.addPortMapping("tcp", localPort, externalPort, "Firewalla API");
       this.addAPIPortMapping(UPNP_INTERVAL * 1000); // add port every hour
     }, time)
@@ -454,6 +450,7 @@ module.exports = class {
         return; // exit if the flag is still on
       }
       
+      let upnp = new UPNP();
       upnp.removePortMapping("tcp", localPort, externalPort);
       this.removeAPIPortMapping(UPNP_INTERVAL * 1000); // remove port every hour
     }, time)
