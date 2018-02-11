@@ -146,7 +146,7 @@ module.exports = class {
           // update system information more often
           setInterval(()=>{
              this.update(null);
-          },1000*60*20);
+          },1000*60*2);
         }
         this.update(null);
         return instance;
