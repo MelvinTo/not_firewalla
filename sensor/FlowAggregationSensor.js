@@ -124,6 +124,12 @@ class FlowAggregationSensor extends Sensor {
           appInfos.push(intel[x])
 
         appInfos.forEach((app) => {
+
+          // no need to group traffic for these two types in particular, FIXME
+          if(app === "technology" || app === "search-portal") {
+            return
+          }
+
           let t = traffic[app];
 
           if(typeof t === 'undefined') {
@@ -193,7 +199,7 @@ class FlowAggregationSensor extends Sensor {
     return async(() => {
       let macs = hostManager.getActiveMACs();
       macs.forEach((mac) => {
-        log.info("FlowAggrSensor on mac", mac, {})
+        log.debug("FlowAggrSensor on mac", mac, {})
         await (this.aggr(mac, ts));
         await (this.aggr(mac, ts + this.config.interval));
         await (this.aggrActivity(mac, ts));
@@ -447,6 +453,12 @@ class FlowAggregationSensor extends Sensor {
   recordCategory(mac, traffic) {
     return async(() => {
       for(let category in traffic) {
+
+        // FIXME
+        // ignore technology and search-portal for better performanced
+        if(category === "technology" || category === "search-portal") {
+          continue
+        }
         let object = traffic[category]
         await (categoryFlowTool.addCategoryFlowObject(mac, category, object))
       }

@@ -114,12 +114,11 @@ class PolicyManager2 {
       const policy = this.jsonToPolicy(event.policy)
       const oldPolicy = this.jsonToPolicy(event.oldPolicy)
       const action = event.action
-
-      log.info("START ENFORCING POLICY", policy.pid, action, {})
       
       switch(action) {
       case "enforce": {
         return async(() => {
+          log.info("START ENFORCING POLICY", policy.pid, action, {})
           await(this.enforce(policy))
         })().catch((err) => {
           log.error("enforce policy failed:" + err)
@@ -132,6 +131,7 @@ class PolicyManager2 {
 
       case "unenforce": {
         return async(() => {
+          log.info("START UNENFORCING POLICY", policy.pid, action, {})
           await(this.unenforce(policy))
         })().catch((err) => {
           log.error("unenforce policy failed:" + err)
@@ -147,6 +147,8 @@ class PolicyManager2 {
           if(!oldPolicy) {
             // do nothing
           } else {
+            log.info("START REENFORCING POLICY", policy.pid, action, {})
+
             await(this.unenforce(oldPolicy))
             await(this.enforce(policy))
           }
@@ -194,7 +196,7 @@ class PolicyManager2 {
 
     setInterval(() => {
       this.queue.checkHealth((error, counts) => {
-        log.info("Policy queue status:", counts, {})
+        log.debug("Policy queue status:", counts, {})
       })
       
     }, 60 * 1000)
@@ -926,6 +928,7 @@ class PolicyManager2 {
             await (Block.advancedBlock(policy.pid, scope, []))
             return categoryBlock.blockCategory(policy.target, {
               blockSet: Block.getDstSet(policy.pid),
+              macSet: Block.getMacSet(policy.pid),
               no_dnsmasq_entry: true
             })
           } else {
@@ -1048,12 +1051,13 @@ class PolicyManager2 {
       case "category":
         return async(() => {
           if(scope) {
-            await (Block.advancedUnblock(policy.pid, scope, []))
-            return categoryBlock.unblockCategory(policy.target, {
+            await (categoryBlock.unblockCategory(policy.target, {
               blockSet: Block.getDstSet(policy.pid),
+              macSet: Block.getMacSet(policy.pid),
               ignoreUnapplyBlock: true,
               no_dnsmasq_entry: true
-            })
+            }))
+            return Block.advancedUnblock(policy.pid, scope, [])
           } else {
             return categoryBlock.unblockCategory(policy.target)
           }
@@ -1074,14 +1078,15 @@ class PolicyManager2 {
         return
       }
 
-      policies.forEach((policy) => {
-        if(policy.match(alarm)) {
-          callback(null, true)
-          return
-        }
+      const matchedPolicies = policies.filter((policy) => {
+        return policy.match(alarm)
       })
-
-      callback(null, false)
+      
+      if(matchedPolicies.length > 0) {
+        callback(null, true)
+      } else {
+        callback(null, false)  
+      }
     })
   }
 

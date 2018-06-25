@@ -38,6 +38,8 @@ const hostManager = new HostManager('cli', 'server');
 const HostTool = require('../net2/HostTool.js')
 const hostTool = new HostTool()
 
+const Accounting = require('../control/Accounting.js');
+const accounting = new Accounting();
 
 const DNSTool = require('../net2/DNSTool.js')
 const dnsTool = new DNSTool()
@@ -243,7 +245,8 @@ module.exports = class {
 
             this.recordCache = []
             this.recording = false
-            this.enableRecording = false
+            this.enableRecording = true
+            this.cc = 0
         }
     }
 
@@ -333,6 +336,7 @@ module.exports = class {
     processIntelData(data) {
         try {
             let obj = JSON.parse(data);
+            log.info("Intel:New",data,obj);
             if (obj['id.orig_h'] == null) {
                 log.error("Intel:Drop", obj);
                 return;
@@ -371,14 +375,23 @@ module.exports = class {
                 return;
             }
             if (obj["id.resp_p"] == 53 && obj["id.orig_h"] != null && obj["answers"] && obj["answers"].length > 0) {
-                // NOTE write up a look up flow here
-
+                if (this.lastDNS!=null) {
+                    if (this.lastDNS['query'] == obj['query']) {
+                        if (JSON.stringify(this.lastDNS['answers']) == JSON.stringify(obj["answers"])) {
+                            log.debug("processDnsData:DNS:Duplicated:", obj['query'],JSON.stringify(obj['answers']));
+                            return;
+                        }
+                    }
+                }
+                this.lastDNS = obj;
                 // record reverse dns as well for future reverse lookup
-                async(() => {
-                  await (dnsTool.addReverseDns(obj['query'], obj['answers']))
-                })()
+              (async () => {
+                await dnsTool.addReverseDns(obj['query'], obj['answers'])
+              })()
 
                 for (let i in obj['answers']) {
+                  const entry = obj['answers'][i];
+
                     let key = "dns:ip:" + obj['answers'][i];
                     let value = {
                         'host': obj['query'],
@@ -398,6 +411,15 @@ module.exports = class {
                         rclient.hmset(key, value, (err, rvalue) => {
                              //   rclient.hincrby(key, "count", 1, (err, value) => {
                              if (err == null) {
+
+                                 if(iptool.isV4Format(entry) || iptool.isV6Format(entry)) {
+                                   sem.emitEvent({
+                                     type: 'DestIPFound',
+                                     ip: entry,
+                                     suppressEventLogging: true
+                                   });
+                                 }
+
                                  if (this.config.bro.dns.expires) {
                                        rclient.expireat(key, parseInt((+new Date) / 1000) + this.config.bro.dns.expires);
                                  }
@@ -545,6 +567,31 @@ module.exports = class {
     return true
   }
   
+  isUDPtrafficAccountable(obj) {
+    const host = obj["id.orig_h"];
+    const dst = obj["id.resp_h"];
+
+    let deviceIP = null;
+
+    if(sysManager.isLocalIP(host)) {
+        deviceIP = host;
+    } else {
+        deviceIP = dst;
+    }
+    
+    let device = null;
+
+    if(iptool.isV4Format(deviceIP)) {
+        device = hostManager.hostsdb[`host:ip4:${deviceIP}`];
+    } else {
+        device = hostManager.hostsdb[`host:ip6:${deviceIP}`];
+    }
+
+    let mac = device && device.o && device.o.mac;
+    
+    return !accounting.isBlockedDevice(mac);
+  }
+
     // Only log ipv4 packets for now
     processConnData(data) {
         try {
@@ -565,6 +612,10 @@ module.exports = class {
 
           if(!this.isConnFlowValid(obj)) {
             return;
+          }
+
+          if(obj.proto === "udp" && !this.isUDPtrafficAccountable(obj)) {
+            return; // ignore udp traffic if they are not valid
           }
 
             // drop layer 3
@@ -599,35 +650,39 @@ module.exports = class {
                     return;
                 }
             }
+
+            //log.error("Conn:Diff:",obj.proto, obj.resp_ip_bytes,obj.resp_pkts, obj.orig_ip_bytes,obj.orig_pkts,obj.resp_ip_bytes-obj.resp_bytes, obj.orig_ip_bytes-obj.orig_bytes);
             if (obj.resp_bytes >100000000) {
                 if (obj.duration<1) {
-                    log.error("Conn:Burst:Drop",obj);
+                    log.debug("Conn:Burst:Drop",obj);
                     return;
                 }
                 let rate = obj.resp_bytes/obj.duration;
                 if (rate>20000000) {
-                    log.error("Conn:Burst:Drop",rate,obj);
+                    log.debug("Conn:Burst:Drop",rate,obj);
                     return;
                 }
                 let packet = obj.resp_bytes/obj.resp_pkts;
                 if (packet >10000000) {
-                    log.error("Conn:Burst:Drop2",packet,obj);
+                    log.debug("Conn:Burst:Drop2",packet,obj);
                     return;
                 }
             }
+
+
             if (obj.orig_bytes >100000000) {
                 if (obj.duration<1) {
-                    log.error("Conn:Burst:Drop:Orig",obj);
+                    log.debug("Conn:Burst:Drop:Orig",obj);
                     return;
                 }
                 let rate = obj.orig_bytes/obj.duration;
                 if (rate>20000000) {
-                    log.error("Conn:Burst:Drop:Orig",rate,obj);
+                    log.debug("Conn:Burst:Drop:Orig",rate,obj);
                     return;
                 }
                 let packet = obj.orig_bytes/obj.orig_pkts;
                 if (packet >10000000) {
-                    log.error("Conn:Burst:Drop2:Orig",packet,obj);
+                    log.debug("Conn:Burst:Drop2:Orig",packet,obj);
                     return;
                 }
             }
@@ -648,6 +703,12 @@ module.exports = class {
                 } else {
                     log.debug("Conn:Adjusted:MissedBytes",obj.conn_state,obj);
                 }
+            }
+
+            if ((obj.orig_bytes>obj.orig_ip_bytes || obj.resp_bytes>obj.resp_ip_bytes) && obj.proto == "tcp") {
+                log.debug("Conn:Burst:Adjust1",obj);
+                obj.orig_bytes = obj.orig_ip_bytes;
+                obj.resp_bytes = obj.resp_ip_bytes;
             }
 
             /*
@@ -692,7 +753,7 @@ module.exports = class {
                     return;
                 }
             } catch (e) {
-                log.error("Conn:Data:Error checking ulticast", e);
+                log.debug("Conn:Data:Error checking ulticast", e);
                 return;
             }
 
@@ -715,7 +776,7 @@ module.exports = class {
                 flowdir = "out";
                 lhost = dst;
             } else {
-                log.error("Conn:Error:Drop", data, host, dst, sysManager.isLocalIP(host), sysManager.isLocalIP(dst));
+                log.debug("Conn:Error:Drop", data, host, dst, sysManager.isLocalIP(host), sysManager.isLocalIP(dst));
                 return;
             }
 
@@ -762,6 +823,9 @@ module.exports = class {
             // Warning for long running tcp flows, the conn structure logs the ts as the
             // first packet.  when this happens, if the flow started a while back, it
             // will get summarize here
+            //if (host == "192.168.2.164" || dst == "192.168.2.164") {
+            //    log.error("Conn:192.168.2.164:",JSON.stringify(obj),null);
+            // }
 
             let now = Math.ceil(Date.now() / 1000);
             let flowspecKey = host + ":" + dst + ":" + flowdir;
@@ -894,9 +958,12 @@ module.exports = class {
                 
             // not sure to use tmpspec.ts or now???
                 if(tmpspec.fd == 'in') {
-                    this.recordTraffic(tmpspec.ts, tmpspec.rb, tmpspec.ob)
+                  // use now instead of the start time of this flow
+                  this.recordTraffic(new Date() / 1000, tmpspec.rb, tmpspec.ob)
+                  //this.recordTraffic(tmpspec.ts, tmpspec.rb, tmpspec.ob)
                 } else {
-                    this.recordTraffic(tmpspec.ts, tmpspec.ob, tmpspec.rb)
+                  this.recordTraffic(new Date() / 1000, tmpspec.ob, tmpspec.rb)
+                  //this.recordTraffic(tmpspec.ts, tmpspec.ob, tmpspec.rb)
                 }
                     
 
@@ -921,7 +988,7 @@ module.exports = class {
                           rb: tmpspec.rb,
                           suppressEventLogging: true
                         });
-                      }, 15 * 1000); // send out in 15 seconds
+                      }, 1 * 1000); // make it a little slower so that dns record will be handled first
 
 
                         if (this.config.bro.conn.expires) {
@@ -1505,9 +1572,9 @@ module.exports = class {
                      obj: obj
                 };
 
-                async(() => {
-                    const srcName = await (hostTool.getName(obj.src))
-                    const dstName = await (hostTool.getName(obj.dst))
+                (async () => {
+                    const srcName = await hostTool.getName(obj.src)
+                    const dstName = await hostTool.getName(obj.dst)
                     if(srcName) {
                         actionobj.shname = srcName
                     }
@@ -1537,19 +1604,19 @@ module.exports = class {
                       })
 
                       if(addresses.length > 0) {
-                        alarm["p.device.ip"] = addresses[0]
-                        alarm["p.device.name"] = addresses[0] // workaround, app side should use mac address to convert
+                        const ip = addresses[0];
+                        alarm["p.device.ip"] = ip;
+                        alarm["p.device.name"] = ip;
+                        const mac = await hostTool.getMacByIP(ip);
+                        if(mac) {
+                          alarm["p.device.mac"] = mac;
+                        }
                       }
 
                       alarm["p.message"] = `${alarm["p.message"].replace(/\.$/, '')} on device: ${addresses.join(",")}`
                     }
 
-                    if(alarm["p.dest.ip"] && alarm["p.dest.ip"] != "0.0.0.0") {
-                        await (am2.enrichDestInfo(alarm))
-                    }
-
-                    await (am2.enrichDeviceInfo(alarm))
-                    await (am2.checkAndSaveAsync(alarm))
+                    await am2.checkAndSaveAsync(alarm)
                 })().catch((err) => {
                     log.error("Failed to generate alarm:", err, {})
                 })
@@ -1566,70 +1633,86 @@ module.exports = class {
     }
 
 
-    recordHit(data) {
-        const ts = Math.floor(data.ts)
-        const inBytes = data.inBytes
-        const outBytes = data.outBytes
+    // recordHit(data) {
+    //     const ts = Math.floor(data.ts)
+    //     const inBytes = data.inBytes
+    //     const outBytes = data.outBytes
     
-        return new Promise((resolve, reject) => {
-            timeSeries.recordHit('download',ts, Number(inBytes)).exec(() => {
-                timeSeries.recordHit('upload',ts, Number(outBytes)).exec(() => {
-                    // do nothing
-                    resolve()
-                })
-            })
-        })    
-      }
+    //     timeSeries
+    //     .recordHit('download',ts, Number(inBytes))
+    //     .recordHit('upload',ts, Number(outBytes))
+    // }
 
-      recordManyHits(datas) {
-          datas.forEach((data) => {
-            const ts = Math.floor(data.ts)
-            const inBytes = data.inBytes
-            const outBytes = data.outBytes
+    //   recordManyHits(datas) {
+    //       datas.forEach((data) => {
+    //         const ts = Math.floor(data.ts)
+    //         const inBytes = data.inBytes
+    //         const outBytes = data.outBytes
 
-            timeSeries.recordHit('download',ts, Number(inBytes))
-            timeSeries.recordHit('upload',ts, Number(outBytes))
-          })
+    //         timeSeries.recordHit('download',ts, Number(inBytes))
+    //         timeSeries.recordHit('upload',ts, Number(outBytes))
+    //       })
 
-          return new Promise((resolve, reject) => {
-            timeSeries.exec(() => {
-                resolve()
-            })
-          })
-      }
+    //       return new Promise((resolve, reject) => {
+    //         timeSeries.exec(() => {
+    //             resolve()
+    //         })
+    //       })
+    //   }
     
       enableRecordHitsTimer() {
-          this.enableRecording = true
           setInterval(() => {
-            this.recordHits()
-          }, 5 * 1000) // every 5 seconds
+            timeSeries.exec(() => {})
+            this.cc = 0
+          }, 1 * 60 * 1000) // every minute to record the left-over items if no new flows
       }
     
-      recordHits() {
-        if(this.recordCache && this.recordCache.length > 0 && this.recording == false) {
-            this.recording = true
-            const copy = JSON.parse(JSON.stringify(this.recordCache))
-            this.recordCache = []
-            async(() => {
-                await(this.recordManyHits(copy))
-            })().finally(() => {
-                this.recording = false
-            })
-        } else {
-            if(this.recording) {
-                log.info("still recording......")
-            }
-        }
-      }
-    
+    //   recordHits() {
+    //     if(this.recordCache && this.recordCache.length > 0 && this.recording == false) {
+    //         this.recording = true
+    //         const copy = JSON.parse(JSON.stringify(this.recordCache))
+    //         this.recordCache = []
+    //         async(() => {
+    //             await(this.recordManyHits(copy))
+    //         })().finally(() => {
+    //             this.recording = false
+    //         })
+    //     } else {
+    //         if(this.recording) {
+    //             log.info("still recording......")
+    //         }
+    //     }
+    //   }
+
       recordTraffic(ts, inBytes, outBytes) {
           if(this.recordCache && this.enableRecording) {
-              log.debug("Recording..", ts, inBytes, outBytes, {})
-              this.recordCache.push({
-                ts: ts,
-                inBytes: inBytes,
-                outBytes: outBytes
-            })
+
+            let normalizedTS = Math.floor(Math.floor(Number(ts)) / 10) // only record every 10 seconds
+                                    
+            if(!this.lastNTS) {
+                this.lastNTS = normalizedTS
+                this.fullLastNTS = Math.floor(ts)
+                this.lastNTS_download = 0
+                this.lastNTS_upload = 0
+            }
+
+            if(this.lastNTS == normalizedTS) {
+                // append current status
+                this.lastNTS_download += Number(inBytes)
+                this.lastNTS_upload += Number(outBytes)
+
+            } else {
+                log.debug("Store timeseries", this.fullLastNTS, this.lastNTS_download, this.lastNTS_upload)
+
+                timeSeries
+                .recordHit('download',this.fullLastNTS, this.lastNTS_download)
+                .recordHit('upload',this.fullLastNTS, this.lastNTS_upload)
+                .exec()
+                
+                this.lastNTS = null
+
+                this.recordTraffic(ts, inBytes, outBytes)
+            }           
           }
       }
 
