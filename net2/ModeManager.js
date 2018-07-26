@@ -51,7 +51,7 @@ function _revert2None() {
     let bootingComplete = await (firewalla.isBootingComplete())
     let firstBindDone = await (firewalla.isFirstBindDone())
     if(!bootingComplete && firstBindDone) {
-      log.info("Revert back to none mode for safety")
+      log.warn("Revert back to none mode for safety")
       return switchToNone()
     }
   })()
