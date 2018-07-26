@@ -33,8 +33,10 @@ mode=${1:-'normal'}
 
 function sync_time() {
     time_website=$1
+    logger "loading time from site $time_website"
     time=$(curl -D - ${time_website} -o /dev/null --silent | awk -F ": " '/^Date: / {print $2}')
     if [[ "x$time" == "x" ]]; then
+        logger "ERROR: failed to get time from website $time_website"
         return 1
     else
         sudo date -s "$time"
