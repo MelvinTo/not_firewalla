@@ -31,6 +31,19 @@ MGIT=$(PATH=/home/pi/scripts:$FIREWALLA_HOME/scripts; /usr/bin/which mgit||echo 
 
 mode=${1:-'normal'}
 
+function sync_time() {
+    time_website=$1
+    time=$(curl -D - ${time_website} -o /dev/null --silent | awk -F ": " '/^Date: / {print $2}')
+    if [[ "x$time" == "x" ]]; then
+        return 1
+    else
+        sudo date -s "$time"
+    fi    
+}
+
+# Need to make sure time is up to date as early as possible
+sync_time status.github.com || sync_time google.com || sync_time live.com || sync_time facebook.com
+
 timeout_check() {
     pid=${1:-$!}
     timeout=${2:-120}
@@ -106,7 +119,7 @@ function sync_time() {
 
 if [[ ! -f /.dockerenv ]]; then
     logger "FIREWALLA.UPGRADE.DATE.SYNC"
-    sync_time status.github.com || sync_time google.com || sync_time live.com || sync_time facebook.com
+#    sync_time status.github.com || sync_time google.com || sync_time live.com || sync_time facebook.com
     sudo systemctl stop ntp
     sudo ntpdate -b -u -s time.nist.gov
     sudo timeout 30 ntpd -gq
