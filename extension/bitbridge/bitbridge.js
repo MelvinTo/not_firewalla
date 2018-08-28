@@ -25,6 +25,7 @@ let Promise = require('bluebird');
 const async = require('asyncawait/async');
 const await = require('asyncawait/await');
 
+const exec = require('child-process-promise').exec
 
 const fc = require('../../net2/config.js')
 
@@ -156,7 +157,7 @@ class BitBridge {
       // ignore error
     }
 
-    this.started = false
+    this.started = false    
     
     return delay(1000) // delay for 1 second before return to ensure bitbridge is stopped
   }
@@ -181,14 +182,18 @@ class BitBridge {
     return async(() => {
       await (exec("touch /home/pi/.firewalla/config/enablev6"))
       await (exec("sudo pkill bitbridge6"))      
-    })()
+    })().catch(err => {
+      log.warn("Error when turn on ipv6", err);
+    })
   }
 
   ipv6Off() {
     return async(() => {
-      await (exec("rm /home/pi/.firewalla/config/enablev6"))
+      await (exec("rm -f /home/pi/.firewalla/config/enablev6"))
       await (exec("sudo pkill bitbridge6"))      
-    })()
+    })().catch(err => {
+      log.warn("Error when turn off ipv6", err);
+    })
   }
 }
 

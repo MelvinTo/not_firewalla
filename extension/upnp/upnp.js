@@ -33,8 +33,8 @@ let util = require('util');
 
 let f = require('../../net2/Firewalla.js');
 
-let natpmp = require('nat-pmp');
-let natupnp = require('nat-upnp');
+let natpmp = require('./nat-pmp');
+let natupnp = require('./nat-upnp');
 
 let upnpClient = natupnp.createClient();
 //upnpClient.timeout = 10000; // set timeout to 10 seconds to avoid timeout too often
@@ -181,6 +181,7 @@ module.exports = class {
     }
 
     removePortMapping(protocol, localPort, externalPort, callback) {
+       callback = callback || function() {}
         this.getCapability(()=>{
             try {
                 if (this.upnpEnabled == true) {

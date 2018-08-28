@@ -16,22 +16,21 @@
 
 const log = require('./logger.js')(__filename);
 
-const redis = require('redis');
-const rclient = redis.createClient();
+const rclient = require('../util/redis_manager.js').getRedisClient()
 
 const Promise = require('bluebird');
-Promise.promisifyAll(redis.RedisClient.prototype);
-Promise.promisifyAll(redis.Multi.prototype);
 
-const async = require('asyncawait/async');
-const await = require('asyncawait/await');
+const f = require('../net2/Firewalla.js')
 
+const iptool = require('ip')
 
 const util = require('util');
 
 const firewalla = require('../net2/Firewalla.js');
 
-const instance = null;
+const RED_HOLE_IP="198.51.100.101";
+
+let instance = null;
 
 class DNSTool {
 
@@ -51,6 +50,14 @@ class DNSTool {
     return util.format("dns:ip:%s", ip);
   }
 
+  getReverseDNSKey(dns) {
+    return `rdns:domain:${dns}`
+  }
+
+  async reverseDNSKeyExists(domain) {
+    const type = await rclient.typeAsync(this.getReverseDNSKey(domain))
+    return type !== 'none';
+  }
 
   dnsExists(ip) {
     let key = this.getDnsKey(ip);
@@ -73,14 +80,66 @@ class DNSTool {
 
     let key = this.getDnsKey(ip);
 
-    log.info("Storing dns for ip", ip);
-
     dns.updateTime = `${new Date() / 1000}`
 
     return rclient.hmsetAsync(key, dns)
       .then(() => {
         return rclient.expireAsync(key, expire);
       });
+  }
+
+  // doesn't have to keep it long, it's only used for instant blocking
+
+  async addReverseDns(dns, addresses, expire) {
+    expire = expire || 24 * 3600; // one day by default
+    addresses = addresses || []
+
+    addresses = addresses.filter((addr) => {
+      return f.isReservedBlockingIP(addr) != true
+    })
+
+    let key = this.getReverseDNSKey(dns)
+
+    const existing = await this.reverseDNSKeyExists(dns)
+    
+    let updated = false
+
+    for (let i = 0; i < addresses.length; i++) {  
+      const addr = addresses[i];
+
+      if(iptool.isV4Format(addr) || iptool.isV6Format(addr)) {
+        await rclient.zaddAsync(key, new Date() / 1000, addr)
+        updated = true
+      }
+    }
+    
+    if(updated === false && existing === false) {
+      await rclient.zaddAsync(key, new Date() / 1000, RED_HOLE_IP); // red hole is a placeholder ip for non-existing domain 
+    }
+
+    await rclient.expireAsync(key, expire)
+  }
+
+  async getAddressesByDNS(dns) {
+    let key = this.getReverseDNSKey(dns)
+    return rclient.zrangeAsync(key, "0", "-1")
+  }
+
+  async getAddressesByDNSPattern(dnsPattern) {
+    let pattern = `rdns:domain:*.${dnsPattern}`
+    
+    let keys = await rclient.keysAsync(pattern)
+    
+    let list = []
+    if(keys) {
+      for (let i = 0; i < keys.length; i++) {
+        const key = keys[i];
+        let l = await rclient.zrangeAsync(key, "0", "-1")
+        list.push.apply(list, l)
+      }
+    }
+    
+    return list
   }
 
   removeDns(ip) {

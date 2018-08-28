@@ -16,15 +16,9 @@
 
 let log = require('./logger.js')(__filename);
 
-let redis = require('redis');
-let rclient = redis.createClient();
+const rclient = require('../util/redis_manager.js').getRedisClient()
 
 let Promise = require('bluebird');
-Promise.promisifyAll(redis.RedisClient.prototype);
-Promise.promisifyAll(redis.Multi.prototype);
-
-let async = require('asyncawait/async');
-let await = require('asyncawait/await');
 
 let async2 = require('async');
 
@@ -34,7 +28,10 @@ let util = require('util');
 
 let flowUtil = require('../net2/FlowUtil.js');
 
-let firewalla = require('../net2/Firewalla.js');
+const firewalla = require('../net2/Firewalla.js');
+
+const DNSTool = require('../net2/DNSTool.js')
+const dnsTool = new DNSTool()
 
 let instance = null;
 
@@ -85,7 +82,7 @@ class IntelTool {
     return rclient.hgetallAsync(key);
   }  
 
-  addIntel(ip, intel, expire) {
+  async addIntel(ip, intel, expire) {
     intel = intel || {}
     expire = expire || 7 * 24 * 3600; // one week by default
 
@@ -95,10 +92,12 @@ class IntelTool {
 
     intel.updateTime = `${new Date() / 1000}`
 
-    return rclient.hmsetAsync(key, intel)
-      .then(() => {
-        return rclient.expireAsync(key, expire);
-      });
+    await rclient.hmsetAsync(key, intel);
+    if(intel.host && intel.ip) {
+      // sync reverse dns info when adding intel
+      await dnsTool.addReverseDns(intel.host, [intel.ip])
+    }
+    return rclient.expireAsync(key, expire);
   }
 
   removeIntel(ip) {
@@ -107,8 +106,19 @@ class IntelTool {
     return rclient.delAsync(key);
   }
 
-  checkIntelFromCloud(ipList, domainList, appList, flow) {
-    log.debug("Checking intel for", ipList, domainList, {});
+  updateHashMapping(hashCache, hash) {
+    if(Array.isArray(hash)) {
+      const origin = hash[0]
+      const hashedOrigin = hash[2]
+      hashCache[hashedOrigin] = origin
+    }
+  }
+
+  checkIntelFromCloud(ipList, domainList, fd, appList, flow) {
+    log.debug("Checking intel for",fd, ipList, domainList, {});
+    if (fd == null) {
+      fd = 'in';
+    }
 
     let flowList = [];
     let _ipList = [];
@@ -121,8 +131,16 @@ class IntelTool {
       _ipList = _ipList.concat(flowUtil.hashHost(ip));
     });
 
+    let hashCache = {}
+
     domainList.forEach((d) => {
-      let hds = flowUtil.hashHost(d);
+      let hds = flowUtil.hashHost(d, {keepOriginal: true});
+      hds.forEach((hash) => {
+        this.updateHashMapping(hashCache, hash)
+      })
+
+      hds = hds.map((x) => x.slice(1, 3)) // remove the origin domains
+
       _hList = _hList.concat(hds);
 
       let ads = flowUtil.hashApp(d);
@@ -139,13 +157,13 @@ class IntelTool {
         _iplist:_ipList,
         _hlist:_hList,
         _alist:_aList,
-        flow:{fd:'in'}});
+        flow:{fd:fd}});
     } else {
       flowList.push({
         _iplist:_ipList,
         _hlist:_hList,
         _alist:_aList,
-        flow:{fd:'in'}});
+        flow:{fd:fd}});
     }
 
     let data = {flowlist:flowList, hashed:1};
@@ -154,10 +172,19 @@ class IntelTool {
 
     return new Promise((resolve, reject) => {
       bone.intel("*","", "check", data, (err, data) => {
-        if(err)
+        if(err) {
+          log.info("IntelCheck Result FAIL:",ipList, data, {});
           reject(err)
-        else {
-          //          log.info("IntelCheck Result:", data, {});
+        } else {
+          if(Array.isArray(data)) {
+            data.forEach((result) => {
+              const ip = result.ip
+              if(hashCache[ip]) {
+                result.originIP = hashCache[ip]
+              }
+            })
+          }
+          log.debug("IntelCheck Result:",ipList, domainList, data, {});
           resolve(data);
         }
 
@@ -173,15 +200,16 @@ class IntelTool {
   getSSLCertificate(ip) {
     let certKey = this.getSSLCertKey(ip);
 
-    return async(() => {
-      let sslInfo = await (rclient.hgetallAsync(certKey));
+    return (async() => {
+      let sslInfo = await rclient.hgetallAsync(certKey);
       if(sslInfo) {
         let subject = sslInfo.subject;
         if(subject) {
           let result = this._parseX509Subject(subject);
           if(result) {
-            sslInfo.CN = result.CN;
-            sslInfo.OU = result.OU;
+            sslInfo.CN = result.CN || ""
+            sslInfo.OU = result.OU || ""
+            sslInfo.O = result.O || ""
           }
         }
 
@@ -221,14 +249,17 @@ class IntelTool {
 
     let key = this.getDNSKey(ip);
 
-    return async(() => {
+    return (async() => {
       // only update if dns key exists
       // let keys = await (rclient.keysAsync(key))
       // FIXME: temporalry disabled keys length check, still insert data even dns entry doesn't exist
 //      if(keys.length > 0) {
+        if (intel && intel.ip) {
+            delete intel.ip;
+        }
         let intelJSON = JSON.stringify(intel);
-        await (rclient.hsetAsync(key, "_intel", intelJSON))
-        await (rclient.expireAsync(key, expireTime))
+        await rclient.hsetAsync(key, "_intel", intelJSON);
+        await rclient.expireAsync(key, expireTime);
 //      }
     })()
   }

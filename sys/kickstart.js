@@ -39,6 +39,8 @@
   */
   
   process.title = "FireKick";
+  require('events').EventEmitter.prototype._maxListeners = 100;
+
   let log = require("../net2/logger.js")(__filename);
   
   let fs = require('fs');
@@ -49,8 +51,7 @@
   let utils = require('../lib/utils.js');
   let uuid = require("uuid");
   let forever = require('forever-monitor');
-  let redis = require("redis");
-  let rclient = redis.createClient();
+  const rclient = require('../util/redis_manager.js').getRedisClient()
   let SSH = require('../extension/ssh/ssh.js');
   let ssh = new SSH('info');
   let led = require('../util/Led.js');
@@ -62,12 +63,9 @@
   let fConfig = require('../net2/config.js');
   
   let Promise = require('bluebird');
-  Promise.promisifyAll(redis.RedisClient.prototype);
-  Promise.promisifyAll(redis.Multi.prototype);
   
-  let async = require('asyncawait/async');
-  let await = require('asyncawait/await');
-  
+  const bone = require("../lib/Bone.js");
+
   let SysManager = require('../net2/SysManager.js');
   let sysManager = new SysManager();
   let firewallaConfig = require('../net2/config.js').getConfig();
@@ -80,10 +78,12 @@
   // nmapSensor.suppressAlarm = true;
   
   let FWInvitation = require('./invitation.js');
+
+  const Diag = require('../extension/diag/app.js');
   
-  async(() => {
-    await (sysManager.setConfig(firewallaConfig));
-    await (interfaceDiscoverSensor.run());
+  (async() => {
+    await sysManager.setConfig(firewallaConfig)
+    await interfaceDiscoverSensor.run()
     // await (nmapSensor.checkAndRunOnce(true));
     // nmapSensor = null;
   })();
@@ -139,7 +139,10 @@
   
   let symmetrickey = generateEncryptionKey(_license);
   
-  
+  // start a diagnostic page for people to access during first binding process
+  const diag = new Diag()
+  diag.start()
+
   let eptcloud = new cloud(eptname, null);
   eptcloud.debug(false);
   let service = null;
@@ -167,8 +170,7 @@
     };
   }
   
-  function initializeGroup(callback) {
-    
+  function initializeGroup(callback) {    
     let groupId = storage.getItemSync('groupId');
     if (groupId != null) {
       log.info("Found stored group x", groupId);
@@ -215,9 +217,38 @@
       }, 15000);
     }
   }
-  
+
+  async function recordAllRegisteredClients(gid) {
+    const groupInfo = eptcloud.groupCache[gid] && eptcloud.groupCache[gid].group
+
+    if(!groupInfo) {
+      return
+    }
+
+    const deviceEID = groupInfo.eid
+
+    const clients = groupInfo.symmetricKeys.filter((client) => client.eid != deviceEID)
+
+    const clientInfos = clients.map((client) => {
+      return JSON.stringify({name: client.displayName, eid: client.eid})
+    })
+
+    const keyName = "sys:ept:members"
+
+    let cmd = [keyName]
+
+    cmd.push.apply(cmd, clientInfos)
+
+    await rclient.delAsync(keyName)
+    
+    if(clientInfos.length > 0) {
+      await rclient.saddAsync(cmd)  
+    }
+  }
+
   function inviteFirstAdmin(gid, callback) {
     log.info("Initializing first admin:", gid);
+
     eptcloud.groupFind(gid, (err, group)=> {
       if (err) {
         log.info("Error looking up group", err, err.stack, {});
@@ -236,22 +267,27 @@
         let count = group.symmetricKeys.length;
         
         rclient.hset("sys:ept", "group_member_cnt", count);
+
+        recordAllRegisteredClients(gid).catch((err) => {
+          log.info("Failed to record registered clients, err:", err, {})
+        })
         
         // new group without any apps bound;
         led.on();
         if (count === 1) {
           let fwInvitation = new FWInvitation(eptcloud, gid, symmetrickey);
+          fwInvitation.diag = diag
           
           let onSuccess = function(payload) {
-            return async(() => {
+            return (async() => {
               log.info("some license stuff on device:", payload, {});
-              await (rclient.hsetAsync("sys:ept", "group_member_cnt", count + 1));
+              await rclient.hsetAsync("sys:ept", "group_member_cnt", count + 1)
               
               postAppLinked(); // app linked, do any post-link tasks
               callback(null, true);
               
               log.info("EXIT KICKSTART AFTER JOIN");
-              
+              led.off();
               setTimeout(()=> {
                 require('child_process').exec("sudo systemctl stop firekick"  , (err, out, code) => {
                 });
@@ -268,6 +304,7 @@
             });
           }
           
+          diag.expireDate = new Date() / 1000 + 3600
           fwInvitation.broadcast(onSuccess, onTimeout);
           
         } else {
@@ -281,14 +318,20 @@
           }
           
           let fwInvitation = new FWInvitation(eptcloud, gid, symmetrickey);
+          fwInvitation.diag = diag
           fwInvitation.totalTimeout = 60 * 10; // 10 mins only for additional binding
           fwInvitation.recordFirstBinding = false // don't record for additional binding
           
           let onSuccess = function(payload) {
-            return async(() => {
-              await (rclient.hsetAsync("sys:ept", "group_member_cnt", count + 1));
+            return (async() => {
+              await recordAllRegisteredClients(gid).catch((err) => {
+                log.info("Failed to record registered clients, err:", err, {})
+              })
+
+              await rclient.hsetAsync("sys:ept", "group_member_cnt", count + 1)
               
               log.info("EXIT KICKSTART AFTER JOIN");
+              led.off();
               require('child_process').exec("sudo systemctl stop firekick"  , (err, out, code) => {
               });
             })();
@@ -301,6 +344,7 @@
             });
           }
           
+          diag.expireDate = new Date() / 1000 + 600
           fwInvitation.broadcast(onSuccess, onTimeout);
           
           callback(null, true);
@@ -316,21 +360,25 @@
     require('child_process').exec("sudo systemctl start brofish");
     require('child_process').exec("sudo systemctl enable brofish"); // even auto-start for future reboots
     
-    // start fire api
-    if (require('fs').existsSync("/tmp/FWPRODUCTION")) {
-      require('child_process').exec("sudo systemctl start fireapi");
-    } else {
-      if (fs.existsSync("/.dockerenv")) {
-        require('child_process').exec("cd api; forever start -a --uid api bin/www");
-      } else {
-        require('child_process').exec("sudo systemctl start fireapi");
-      }
-    }
+    // // start fire api
+    // if (require('fs').existsSync("/tmp/FWPRODUCTION")) {
+    //   require('child_process').exec("sudo systemctl start fireapi");
+    // } else {
+    //   if (fs.existsSync("/.dockerenv")) {
+    //     require('child_process').exec("cd api; forever start -a --uid api bin/www");
+    //   } else {
+    //     require('child_process').exec("sudo systemctl start fireapi");
+    //   }
+    // }
   }
   
   function login() {
     eptcloud.eptlogin(config.appId, config.appSecret, null, config.endpoint_name, function (err, result) {
       if (err == null) {
+        log.info("Cloud Logged In")
+
+        diag.connected = true
+
         initializeGroup(function (err, gid) {
           let groupid = gid;
           if (gid) {

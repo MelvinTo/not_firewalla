@@ -14,15 +14,14 @@
  */
 'use strict';
 
-let log = require('../net2/logger.js')(__filename);
+const log = require('../net2/logger.js')(__filename);
 
 let util = require('util');
 
 let Sensor = require('./Sensor.js').Sensor;
 
-let redis = require("redis");
-let rclient = redis.createClient();
-let pubClient = redis.createClient();
+const rclient = require('../util/redis_manager.js').getRedisClient()
+const sclient = require('../util/redis_manager.js').getSubscriptionClient()
 
 const PolicyManager2 = require('../alarm/PolicyManager2.js')
 const pm2 = new PolicyManager2()
@@ -34,8 +33,6 @@ const HostTool = require('../net2/HostTool.js')
 const hostTool = new HostTool()
 
 let Promise = require('bluebird');
-Promise.promisifyAll(redis.RedisClient.prototype);
-Promise.promisifyAll(redis.Multi.prototype);
 
 let async = require('asyncawait/async');
 let await = require('asyncawait/await');
@@ -49,7 +46,11 @@ class OldDataCleanSensor extends Sensor {
 
   getExpiredDate(type) {
     let expireInterval = (this.config[type] && this.config[type].expires) || 0;
-    let minInterval = 8 * 60 * 60;
+    if(expireInterval < 0) {
+      return null;
+    }
+
+    let minInterval = 30 * 60;
     expireInterval = Math.max(expireInterval, minInterval);
 
     return Date.now() / 1000 - expireInterval;
@@ -57,25 +58,24 @@ class OldDataCleanSensor extends Sensor {
 
   getCount(type) {
     let count = (this.config[type] && this.config[type].count) || 10000;
+    if(count < 0) {
+      return null;
+    }
     return count;
   }
 
-  cleanByExpireDate(key, expireDate) {
-    return rclient.zremrangebyscoreAsync(key, "-inf", expireDate)
-      .then((count) => {
-        if(count > 0) {
-          log.info(util.format("%d entries in %s are cleaned by expired date", count, key));
-        }
-      });
+  async cleanByExpireDate(key, expireDate) {
+    const count = await rclient.zremrangebyscoreAsync(key, "-inf", expireDate);
+    if(count > 10) {
+      log.info(util.format("%d entries in %s are cleaned by expired date", count, key));
+    }
   }
 
-  cleanToCount(key, leftOverCount) {
-    return rclient.zremrangebyrankAsync(key, 0, -1 * leftOverCount)
-      .then((count) => {
-        if(count > 0) {
-          log.info(util.format("%d entries in %s are cleaned by count", count, key));
-        }
-      });
+  async cleanToCount(key, leftOverCount) {
+    const count = await rclient.zremrangebyrankAsync(key, 0, -1 * leftOverCount)
+    if(count > 10) {
+      log.info(util.format("%d entries in %s are cleaned by count", count, key));
+    }
   }
 
   getKeys(keyPattern) {
@@ -83,9 +83,7 @@ class OldDataCleanSensor extends Sensor {
   }
 
   // clean by expired time and count
-  regularClean(type, keyPattern, ignorePatterns) {
-
-    return async(() => {
+  async regularClean(type, keyPattern, ignorePatterns) {
       let keys = await (this.getKeys(keyPattern));
 
       if(ignorePatterns) {
@@ -94,13 +92,15 @@ class OldDataCleanSensor extends Sensor {
         });
       }
 
-      keys.forEach((key) => {
-        await (this.cleanByExpireDate(key, this.getExpiredDate(type)));
-        await (this.cleanToCount(key, this.getCount(type)));
-      })
-
-    })();
-
+      for (let index = 0; index < keys.length; index++) {
+        const key = keys[index];
+        const expireDate = this.getExpiredDate(type);
+        if(expireDate !== null) {
+          await this.cleanByExpireDate(key, expireDate);
+        }
+        const count = this.getCount(type);
+        await this.cleanToCount(key, count);
+      }
   }
 
   cleanAlarm() {
@@ -230,7 +230,12 @@ class OldDataCleanSensor extends Sensor {
 
   cleanDuplicatedException() {
     return async(() => {
-      const exceptions = await (em.loadExceptionsAsync())
+      let exceptions = [];
+      try {
+        exceptions = await(em.loadExceptionsAsync());
+      } catch (err) {
+        log.error("Error when loadExceptions", err);
+      }
 
       let toBeDeleted = []
 
@@ -247,7 +252,11 @@ class OldDataCleanSensor extends Sensor {
 
       for(let k in toBeDeleted) {
         let e = toBeDeleted[k]
-        await (em.deleteException(e.eid))
+        try {
+          await(em.deleteException(e.eid))
+        } catch (err) {
+          log.error("Error when delete exception", err);
+        }
       }
     })()
   }
@@ -263,6 +272,15 @@ class OldDataCleanSensor extends Sensor {
       })
     })()
   }
+
+  // async cleanBlueRecords() {
+  //   const keyPattern = "blue:history:domain:*"
+  //   const keys = await rclient.keysAsync(keyPattern);
+  //   for (let i = 0; i < keys.length; i++) {
+  //     const key = keys[i];
+  //     await rclient.zremrangebyscoreAsync(key, '-inf', Math.floor(new Date() / 1000 - 3600 * 48)) // keep two days
+  //   }
+  // }
 
   oneTimeJob() {
     return async(() => {
@@ -284,29 +302,73 @@ class OldDataCleanSensor extends Sensor {
       await (this.regularClean("software", "software:*"));
       await (this.regularClean("monitor", "monitor:flow:*"));
       await (this.regularClean("alarm", "alarm:ip4:*"));
+      await (this.regularClean("sumflow", "sumflow:*"));
+      await (this.regularClean("aggrflow", "aggrflow:*"));
+      await (this.regularClean("syssumflow", "syssumflow:*"));
       await (this.cleanHourlyStats());
       await (this.cleanUserAgents());
       await (this.cleanHostData("host:ip4", "host:ip4:*", 60*60*24*30));
       await (this.cleanHostData("host:ip6", "host:ip6:*", 60*60*24*30));
       await (this.cleanHostData("host:mac", "host:mac:*", 60*60*24*365));
+      // await (this.cleanBlueRecords())
       log.info("scheduledJob is executed successfully");
-    })();
+    })().catch((err) => {
+      log.error("Failed to run scheduled job, err:", err);
+    });
   }
 
   listen() {
-    pubClient.on("message", (channel, message) => {
+    sclient.on("message", (channel, message) => {
       if(channel === "OldDataCleanSensor" && message === "Start") {
         this.scheduledJob();
       }
     });
-    pubClient.subscribe("OldDataCleanSensor");
+    sclient.subscribe("OldDataCleanSensor");
     log.info("Listen on channel FlowDataCleanSensor");
+  }
+
+
+  // could be disabled in the future when all policy blockin rule is migrated to general policy rules
+  hostPolicyMigration() {
+    return async(() => {
+      const keys = await (rclient.keysAsync("policy:mac:*"))
+      if(keys) {
+        keys.forEach((key) => {
+          const blockin = await (rclient.hgetAsync(key, "blockin"))
+          if(blockin && blockin == "true") {
+            const mac = key.replace("policy:mac:", "")
+            const rule = await (pm2.findPolicy(mac, "mac"))
+            if(!rule) {
+              log.info(`Migrating blockin policy for host ${mac} to policyRule`)
+              const hostInfo = await (hostTool.getMACEntry(mac))
+              const newRule = pm2.createPolicy({
+                target: mac,
+                type: "mac",
+                target_name: hostInfo.name || hostInfo.bname || hostInfo.ipv4Addr,
+                target_ip: hostInfo.ipv4Addr // target_name and target ip are necessary for old app display
+              })
+              const result = await (pm2.checkAndSaveAsync(newRule))
+              if(result) {
+                await (rclient.hsetAsync(key, "blockin", false))
+                log.info("Migrated successfully")
+              } else {
+                log.error("Failed to migrate")
+              }
+            }
+          }
+        })
+      }
+    })().catch((err) => {
+      log.error("Failed to migrate host policy rules:", err, {})
+    })
   }
 
   run() {
     super.run();
 
     this.listen();
+
+    this.hostPolicyMigration()
 
     setTimeout(() => {
       this.scheduledJob();

@@ -25,19 +25,19 @@ var upgradeManager = require("./UpgradeManager.js");
 
 let sem = require('../sensor/SensorEventManager.js').getInstance();
 
-var redis = require("redis");
-var rclient = redis.createClient();
-var sclient = redis.createClient();
-sclient.setMaxListeners(0);
+const rclient = require('../util/redis_manager.js').getRedisClient()
+const sclient = require('../util/redis_manager.js').getSubscriptionClient()
+const pclient = require('../util/redis_manager.js').getPublishClient()
+
 
 let Promise = require('bluebird');
-Promise.promisifyAll(redis.RedisClient.prototype);
-Promise.promisifyAll(redis.Multi.prototype);
 
 const async = require('asyncawait/async');
 const await = require('asyncawait/await');
 
 const exec = require('child-process-promise').exec
+
+const serialFiles = ["/sys/block/mmcblk0/device/serial", "/sys/block/mmcblk1/device/serial"];
 
 var bone = require("../lib/Bone.js");
 var systemDebug = false;
@@ -214,7 +214,7 @@ module.exports = class {
     debugOn(callback) {
         rclient.set("system:debug", "1", (err) => {
             systemDebug = true;
-            rclient.publish("System:DebugChange", "1");
+            pclient.publish("System:DebugChange", "1");
             callback(err);
         });
     }
@@ -222,7 +222,7 @@ module.exports = class {
     debugOff(callback) {
         rclient.set("system:debug", "0", (err) => {
             systemDebug = false;
-            rclient.publish("System:DebugChange", "0");
+            pclient.publish("System:DebugChange", "0");
             callback(err);
         });
     }
@@ -239,23 +239,42 @@ module.exports = class {
     return rclient.hdelAsync("sys:config", "branch.changed")
   }
 
-    systemRebootedDueToIssue(reset) {
-       try {
-           if (require('fs').existsSync("/home/pi/.firewalla/managed_reboot")) {
-               log.info("SysManager:RebootDueToIssue");
-               if (reset == true) {
-                   require('fs').unlinkSync("/home/pi/.firewalla/managed_reboot");
-               }
-               return true;
-           }
-       } catch(e) {
-           return false;
-       }
-       return false;
+  systemRebootedDueToIssue(reset) {
+     try {
+         if (require('fs').existsSync("/home/pi/.firewalla/managed_reboot")) {
+             log.info("SysManager:RebootDueToIssue");
+             if (reset == true) {
+                 require('fs').unlinkSync("/home/pi/.firewalla/managed_reboot");
+             }
+             return true;
+         }
+     } catch(e) {
+         return false;
+     }
+     return false;
+  }
+
+  systemRebootedByUser(reset) {
+    try {
+      if (require('fs').existsSync("/home/pi/.firewalla/managed_real_reboot")) {
+        log.info("SysManager:RebootByUser");
+        if (reset == true) {
+          require('fs').unlinkSync("/home/pi/.firewalla/managed_real_reboot");
+        }
+        return true;
+      }
+    } catch (e) {
+      return false;
     }
+    return false;
+  }
 
   setLanguage(language, callback) {
     callback = callback || function() {}
+
+    // FIXME: disable set language feature temporarliy
+    callback(null);
+    return;
 
     this.language = language;
     const theLanguage = i18n.setLocale(this.language);
@@ -268,9 +287,21 @@ module.exports = class {
       if(err) {
         log.error("Failed to set language " + language + ", err: " + err);
       }
-      rclient.publish("System:LanguageChange", language);
+      pclient.publish("System:LanguageChange", language);
       callback(err);
     });
+  }
+
+  setLanguageAsync(language) {
+    return new Promise((resolve, reject) => {
+      this.setLanguage(language, (err) => {
+        if(err) {
+          reject(err)
+        } else {
+          resolve()
+        }
+      })
+    })
   }
 
   setTimezone(timezone, callback) {
@@ -281,7 +312,7 @@ module.exports = class {
       if(err) {
         log.error("Failed to set timezone " + timezone + ", err: " + err);
       }
-      rclient.publish("System:TimezoneChange", timezone);
+      pclient.publish("System:TimezoneChange", timezone);
 
       // TODO: each running process may not be set to the target timezone until restart
       async(() => {
@@ -410,7 +441,7 @@ module.exports = class {
   myIp2() {
     let secondInterface = this.sysinfo &&
         this.config.monitoringInterface2 &&
-        this.sysinfo[this.sysinfo.monitoringInterface2]
+        this.sysinfo[this.config.monitoringInterface2]
 
     if(secondInterface) {
       return secondInterface.ip_address
@@ -538,12 +569,25 @@ module.exports = class {
 -rw-rw-r-- 1 pi pi 19 Sep 30 06:55 REPO_TAG
 */
 
+
+
     getSysInfo(callback) {
       let serial = null;
       if (f.isDocker() || f.isTravis()) {
         serial = require('child_process').execSync("basename \"$(head /proc/1/cgroup)\" | cut -c 1-12").toString().replace(/\n$/, '')
       } else {
-        serial = require('fs').readFileSync("/sys/block/mmcblk0/device/serial",'utf8');
+          for (let index = 0; index < serialFiles.length; index++) {
+              const serialFile = serialFiles[index];
+             try {
+                serial = require('fs').readFileSync(serialFile,'utf8');
+                break;
+            } catch(err) { 
+            }
+        }
+
+        if(serial === null) {
+            serial = "unknown";
+        }
       }
 
       let repoBranch = ""
@@ -644,10 +688,9 @@ module.exports = class {
 
     isLocalIP(ip) {
         if (iptool.isV4Format(ip)) {
-
-            if (this.subnet == null) {
-                this.subnet = this.sysinfo[this.config.monitoringInterface].subnet;
-            }
+          
+            this.subnet = this.sysinfo[this.config.monitoringInterface].subnet;
+          
             if (this.subnet == null) {
                 log.error("SysManager:Error getting subnet ");
                 return true;

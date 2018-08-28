@@ -228,7 +228,7 @@ class NmapSensor extends Sensor {
             return;
           }
           hosts.forEach((h) => {
-            log.info("Found device:", h.ipv4Addr, {});
+            log.debug("Found device:", h.ipv4Addr, {});
             this._processHost(h);
           })
 
@@ -257,6 +257,8 @@ class NmapSensor extends Sensor {
     if(!host.mac) {
       if(host.ipv4Addr && host.ipv4Addr === sysManager.myIp()) {
         host.mac = sysManager.myMAC()
+      } else if(host.ipv4Addr && host.ipv4Addr === sysManager.myIp2()) {
+        return // do nothing on secondary ip
       } else {
         log.error("Invalid MAC Address for host", host, {})
         return

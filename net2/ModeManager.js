@@ -13,7 +13,7 @@
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 'use strict';
-let log = require("./logger.js")(__filename);
+const log = require("./logger.js")(__filename);
 let fConfig = require('./config.js').getConfig();
 
 let secondaryInterface = require("./SecondaryInterface.js");
@@ -36,12 +36,12 @@ let sem = require('../sensor/SensorEventManager.js').getInstance();
 
 let curMode = null;
 
-let redis = require('redis');
-let rclient = redis.createClient();
+const sclient = require('../util/redis_manager.js').getSubscriptionClient()
+const pclient = require('../util/redis_manager.js').getPublishClient()
 
-Promise.promisifyAll(redis.RedisClient.prototype);
 
-const AUTO_REVERT_INTERVAL = 240 * 1000 // 4 minutes
+
+const AUTO_REVERT_INTERVAL = 600 * 1000 // 10 minutes
 
 let timer = null
 
@@ -51,7 +51,7 @@ function _revert2None() {
     let bootingComplete = await (firewalla.isBootingComplete())
     let firstBindDone = await (firewalla.isFirstBindDone())
     if(!bootingComplete && firstBindDone) {
-      log.info("Revert back to none mode for safety")
+      log.warn("Revert back to none mode for safety")
       return switchToNone()
     }
   })()
@@ -262,7 +262,7 @@ function mode() {
 
 // listen on mode change, if anyone update mode in redis, re-apply it
 function listenOnChange() {
-  rclient.on("message", (channel, message) => {
+  sclient.on("message", (channel, message) => {
     if(channel === "Mode:Change") {
       if(curMode !== message) {
         log.info("Mode is changed to " + message);                
@@ -276,18 +276,18 @@ function listenOnChange() {
       sm.loadManualSpoofs(hostManager)
     }
   });
-  rclient.subscribe("Mode:Change");
-  rclient.subscribe("ManualSpoof:Update");
+  sclient.subscribe("Mode:Change");
+  sclient.subscribe("ManualSpoof:Update");
 }
 
 // this function can only used by non-main.js process
 // it is used to notify main.js that mode has been changed
 function publish(mode) {
-  return rclient.publishAsync("Mode:Change", mode);
+  return pclient.publishAsync("Mode:Change", mode);
 }
 
 function publishManualSpoofUpdate() {
-  return rclient.publishAsync("ManualSpoof:Update", "1")
+  return pclient.publishAsync("ManualSpoof:Update", "1")
 }
 
 function setSpoofAndPublish() {

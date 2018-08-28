@@ -21,9 +21,6 @@ var sysManager = new SysManager('info');
 var firewalla = require('../net2/Firewalla.js');
 var fHome = firewalla.getFirewallaHome();
 
-var redis = require("redis");
-var rclient = redis.createClient();
-
 var later = require('later');
 var publicIp = require('public-ip');
 
@@ -282,7 +279,9 @@ module.exports = class {
                 mydns = "8.8.8.8"; // use google DNS as default
             }
             
-            let cmd = util.format("cd %s/vpn; sudo -E ./ovpngen.sh %s %s %s %s %s; sync", fHome, clientname, password, sysManager.myIp(), ip, mydns);
+            const vpnLockFile = "/dev/shm/vpn_gen_lock_file";
+
+            let cmd = util.format("cd %s/vpn; flock -n %s -c 'sudo -E ./ovpngen.sh %s %s %s %s %s'; sync", fHome, vpnLockFile, clientname, password, sysManager.myIp(), ip, mydns);
             log.info("VPNManager:GEN", cmd);
             this.getovpn = require('child_process').exec(cmd, (err, out, code) => {
                 if (err) {

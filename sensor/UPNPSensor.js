@@ -19,10 +19,9 @@ let Sensor = require('./Sensor.js').Sensor;
 
 let sem = require('../sensor/SensorEventManager.js').getInstance();
 
-let redis = require('redis');
-let rclient = redis.createClient();
+const rclient = require('../util/redis_manager.js').getRedisClient()
 
-let natUpnp = require('nat-upnp');
+let natUpnp = require('../extension/upnp/nat-upnp');
 
 class UPNPSensor extends Sensor {
   constructor() {

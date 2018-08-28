@@ -1,0 +1,12 @@
+[Unit]
+Description=Firewalla HTTPD
+After=network.target
+
+[Service]
+User=pi
+Restart=always
+WorkingDirectory=/home/pi/firewalla/
+ExecStart=/bin/bash -c '/home/pi/firewalla/extension/httpd/httpd.sh >> /home/pi/.forever/blue.log 2>&1'
+
+[Install]
+WantedBy=multi-user.target

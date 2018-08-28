@@ -10,10 +10,19 @@ module.exports = {
 
 // Take host and return hashed
 // [[a,a'],[b,b']]
-function hashHost(_domain) {
+function hashHost(_domain, opts) {
   let results = urlHash.canonicalizeAndHashExpressions(_domain);
   if(results) {
-    return results.map(x => x.slice(1,3))
+    if (opts && opts.keepOriginal) {
+      return results.map(x => {
+        if (x[0].endsWith('/')) {
+          x[0] = x[0].substr(0, x[0].length - 1);
+        }
+        return x;
+      });
+    } else {
+      return results.map(x => x.slice(1, 3));
+    }
   } else {
     return null;
   }
@@ -122,27 +131,27 @@ function hashFlow(_flow, clean) {
 //    not to be presented to user or do security lookup.
 
 function addFlag(flow,flag) {
-    if (flow == null || flag == null) {
+    if (!flow || !flag) {
         return flow.f;
     }
-    if (checkFlag(flow,flag)==false) {
-        if (flow.f == null) {
+    if (!checkFlag(flow,flag)) {
+        if (!flow.f) {
             flow.f = flag;
         } else {
-            flow.f = flow.f+flag;
+            flow.f = flow.f + flag;
         }
     }
     return flow.f;
 }
 
 function checkFlag(flow,flag) {
-    if (flow.f == null) {
+    if (!flow.f) {
         return false;
     }
-    if (flag == null) {
+    if (!flag) {
         return true;
     }
-    return (flow.f.indexOf(flag)>=0);
+    return (flow.f.indexOf(flag) >= 0);
 }
 
 /*

@@ -45,7 +45,7 @@ class IPv6DiscoverySensor extends Sensor {
     this.enabled = true; // very basic feature, always enabled
     let p = require('../net2/MessageBus.js');
     this.publisher = new p('info','Scan:Done', 10);
-    log.info("Starting IPv6DiscoverySensor Interfaces [",this.networkInterface,"]");
+    log.debug("Starting IPv6DiscoverySensor Interfaces [",this.networkInterface,"]");
   }
 
   run() {
@@ -109,7 +109,7 @@ class IPv6DiscoverySensor extends Sensor {
     sem.emitEvent({
       type: "DeviceUpdate",
       message: "A new ipv6 is found @ IPv6DisocverySensor",
-      suppressAlarm: this.suppressAlarm,
+      suppressAlarm: true,
       host:  {
         ipv6Addr: v6addrs,
         mac: mac.toUpperCase()

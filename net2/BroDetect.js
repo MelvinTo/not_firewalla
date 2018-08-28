@@ -18,8 +18,9 @@
 let log = require('./logger.js')(__filename);
 
 var Tail = require('always-tail');
-var redis = require("redis");
-var rclient = redis.createClient();
+
+const rclient = require('../util/redis_manager.js').getRedisClient()
+
 var iptool = require("ip");
 var useragent = require('useragent');
 
@@ -27,8 +28,6 @@ const SysManager = require('./SysManager.js');
 const sysManager = new SysManager('info');
 const DNSManager = require('./DNSManager.js');
 const dnsManager = new DNSManager();
-const AlarmManager = require('./AlarmManager.js');
-const alarmManager = new AlarmManager('info');
 const Alarm = require('../alarm/Alarm.js');
 const AM2 = require('../alarm/AlarmManager2.js');
 const am2 = new AM2();
@@ -36,6 +35,14 @@ const am2 = new AM2();
 const HostManager = require('../net2/HostManager')
 const hostManager = new HostManager('cli', 'server');
 
+const HostTool = require('../net2/HostTool.js')
+const hostTool = new HostTool()
+
+const Accounting = require('../control/Accounting.js');
+const accounting = new Accounting();
+
+const DNSTool = require('../net2/DNSTool.js')
+const dnsTool = new DNSTool()
 
 const async = require('asyncawait/async');
 const await = require('asyncawait/await');
@@ -46,11 +53,9 @@ var linux = require('../util/linux.js');
 
 let l2 = require('../util/Layer2.js');
 
-rclient.on("error", function (err) {
-    log.info("Redis(alarm) Error " + err);
-});
+const timeSeries = require("../util/TimeSeries.js").getTimeSeries()
 
-let sem = require('../sensor/SensorEventManager.js').getInstance();
+const sem = require('../sensor/SensorEventManager.js').getInstance();
 let appmapsize = 200;
 
 /*
@@ -91,11 +96,11 @@ function ValidateIPaddress(ipaddress)
 
 module.exports = class {
     initWatchers() {
-        log.info("Initializing watchers", this.config.bro);
+        log.debug("Initializing watchers", this.config.bro);
         if (this.intelLog == null) {
             this.intelLog = new Tail(this.config.bro.intel.path, '\n');
             if (this.intelLog != null) {
-                log.info("Initializing watchers: intelog initialized:", this.config.bro.intel.path);
+                log.debug("Initializing watchers: intelog initialized:", this.config.bro.intel.path);
                 this.intelLog.on('line', (data) => {
                     log.debug("Detect:Intel ", data);
                     this.processIntelData(data);
@@ -108,7 +113,7 @@ module.exports = class {
         if (this.noticeLog == null) {
             this.noticeLog = new Tail(this.config.bro.notice.path, '\n');
             if (this.noticeLog != null) {
-                log.info("Initializing watchers: noticeLog initialized", this.config.bro.notice.path);
+                log.debug("Initializing watchers: noticeLog initialized", this.config.bro.notice.path);
                 this.noticeLog.on('line', (data) => {
                     log.debug("Detect:Notice", data);
                     this.processNoticeData(data);
@@ -121,7 +126,7 @@ module.exports = class {
         if (this.dnsLog == null) {
             this.dnsLog = new Tail(this.config.bro.dns.path, '\n');
             if (this.dnsLog != null) {
-                log.info("Initializing watchers: dnslog initialized", this.config.bro.dns.path);
+                log.debug("Initializing watchers: dnslog initialized", this.config.bro.dns.path);
                 this.dnsLog.on('line', (data) => {
                     this.processDnsData(data);
                 });
@@ -133,7 +138,7 @@ module.exports = class {
         if (this.softwareLog == null) {
             this.softwareLog = new Tail(this.config.bro.software.path, '\n');
             if (this.softwareLog != null) {
-                log.info("Initializing watchers: software initialized", this.config.bro.software.path);
+                log.debug("Initializing watchers: software initialized", this.config.bro.software.path);
                 this.softwareLog.on('line', (data) => {
                     log.debug("Detect:Software", data);
                     this.processSoftwareData(data);
@@ -146,7 +151,7 @@ module.exports = class {
         if (this.httpLog == null) {
             this.httpLog = new Tail(this.config.bro.http.path, '\n');
             if (this.httpLog != null) {
-                log.info("Initializing watchers: http initialized", this.config.bro.http.path);
+                log.debug("Initializing watchers: http initialized", this.config.bro.http.path);
                 this.httpLog.on('line', (data) => {
                     log.debug("Detect:Http", data);
                     this.processHttpData(data);
@@ -159,7 +164,7 @@ module.exports = class {
         if (this.sslLog == null) {
             this.sslLog = new Tail(this.config.bro.ssl.path, '\n');
             if (this.sslLog != null) {
-                log.info("Initializing watchers: sslinitialized", this.config.bro.ssl.path);
+                log.debug("Initializing watchers: sslinitialized", this.config.bro.ssl.path);
                 this.sslLog.on('line', (data) => {
                     log.debug("Detect:SSL", data);
                     this.processSslData(data);
@@ -172,7 +177,7 @@ module.exports = class {
         if (this.connLog == null) {
             this.connLog = new Tail(this.config.bro.conn.path, '\n');
             if (this.connLog != null) {
-                log.info("Initializing watchers: connInitialized", this.config.bro.conn.path);
+                log.debug("Initializing watchers: connInitialized", this.config.bro.conn.path);
                 this.connLog.on('line', (data) => {
                     this.processConnData(data);
                 });
@@ -183,7 +188,7 @@ module.exports = class {
         if (this.connLogdev == null) {
             this.connLogdev = new Tail(this.config.bro.conn.pathdev, '\n');
             if (this.connLogdev != null) {
-                log.info("Initializing watchers: connInitialized", this.config.bro.conn.pathdev);
+                log.debug("Initializing watchers: connInitialized", this.config.bro.conn.pathdev);
                 this.connLogdev.on('line', (data) => {
                     this.processConnData(data);
                 });
@@ -195,7 +200,7 @@ module.exports = class {
         if (this.x509Log == null) {
             this.x509Log = new Tail(this.config.bro.x509.path, '\n');
             if (this.x509Log != null) {
-                log.info("Initializing watchers: X509 Initialized", this.config.bro.x509.path);
+                log.debug("Initializing watchers: X509 Initialized", this.config.bro.x509.path);
                 this.x509Log.on('line', (data) => {
                     this.processX509Data(data);
                 });
@@ -207,7 +212,7 @@ module.exports = class {
         if (this.knownHostsLog == null) {
             this.knownHostsLog = new Tail(this.config.bro.knownHosts.path, '\n');
             if (this.knownHostsLog != null) {
-                log.info("Initializing watchers: knownHosts Initialized", this.config.bro.knownHosts.path);
+                log.debug("Initializing watchers: knownHosts Initialized", this.config.bro.knownHosts.path);
                 this.knownHostsLog.on('line', (data) => {
                     this.processknownHostsData(data);
                 });
@@ -237,16 +242,21 @@ module.exports = class {
             this.flowstash = {};
             this.flowstashExpires = Date.now() / 1000 + this.config.bro.conn.flowstashExpires;
             this.flowstashStart = Date.now() / 1000 + this.config.bro.conn.flowstashExpires;
+
+            this.recordCache = []
+            this.recording = false
+            this.enableRecording = true
+            this.cc = 0
         }
     }
 
     start() {
         if (this.intelLog) {
-            log.info("Start watching intel log");
+            log.debug("Start watching intel log");
             this.intelLog.watch();
         }
         if (this.noticeLog) {
-            log.info("Start watching notice log");
+            log.debug("Start watching notice log");
             this.noticeLog.watch();
         }
     }
@@ -326,6 +336,7 @@ module.exports = class {
     processIntelData(data) {
         try {
             let obj = JSON.parse(data);
+            log.info("Intel:New",data,obj);
             if (obj['id.orig_h'] == null) {
                 log.error("Intel:Drop", obj);
                 return;
@@ -364,8 +375,23 @@ module.exports = class {
                 return;
             }
             if (obj["id.resp_p"] == 53 && obj["id.orig_h"] != null && obj["answers"] && obj["answers"].length > 0) {
-                // NOTE write up a look up flow here
+                if (this.lastDNS!=null) {
+                    if (this.lastDNS['query'] == obj['query']) {
+                        if (JSON.stringify(this.lastDNS['answers']) == JSON.stringify(obj["answers"])) {
+                            log.debug("processDnsData:DNS:Duplicated:", obj['query'],JSON.stringify(obj['answers']));
+                            return;
+                        }
+                    }
+                }
+                this.lastDNS = obj;
+                // record reverse dns as well for future reverse lookup
+              (async () => {
+                await dnsTool.addReverseDns(obj['query'], obj['answers'])
+              })()
+
                 for (let i in obj['answers']) {
+                  const entry = obj['answers'][i];
+
                     let key = "dns:ip:" + obj['answers'][i];
                     let value = {
                         'host': obj['query'],
@@ -385,6 +411,15 @@ module.exports = class {
                         rclient.hmset(key, value, (err, rvalue) => {
                              //   rclient.hincrby(key, "count", 1, (err, value) => {
                              if (err == null) {
+
+                                 if(iptool.isV4Format(entry) || iptool.isV6Format(entry)) {
+                                   sem.emitEvent({
+                                     type: 'DestIPFound',
+                                     ip: entry,
+                                     suppressEventLogging: true
+                                   });
+                                 }
+
                                  if (this.config.bro.dns.expires) {
                                        rclient.expireat(key, parseInt((+new Date) / 1000) + this.config.bro.dns.expires);
                                  }
@@ -532,6 +567,31 @@ module.exports = class {
     return true
   }
   
+  isUDPtrafficAccountable(obj) {
+    const host = obj["id.orig_h"];
+    const dst = obj["id.resp_h"];
+
+    let deviceIP = null;
+
+    if(sysManager.isLocalIP(host)) {
+        deviceIP = host;
+    } else {
+        deviceIP = dst;
+    }
+    
+    let device = null;
+
+    if(iptool.isV4Format(deviceIP)) {
+        device = hostManager.hostsdb[`host:ip4:${deviceIP}`];
+    } else {
+        device = hostManager.hostsdb[`host:ip6:${deviceIP}`];
+    }
+
+    let mac = device && device.o && device.o.mac;
+    
+    return !accounting.isBlockedDevice(mac);
+  }
+
     // Only log ipv4 packets for now
     processConnData(data) {
         try {
@@ -552,6 +612,10 @@ module.exports = class {
 
           if(!this.isConnFlowValid(obj)) {
             return;
+          }
+
+          if(obj.proto === "udp" && !this.isUDPtrafficAccountable(obj)) {
+            return; // ignore udp traffic if they are not valid
           }
 
             // drop layer 3
@@ -586,35 +650,39 @@ module.exports = class {
                     return;
                 }
             }
+
+            //log.error("Conn:Diff:",obj.proto, obj.resp_ip_bytes,obj.resp_pkts, obj.orig_ip_bytes,obj.orig_pkts,obj.resp_ip_bytes-obj.resp_bytes, obj.orig_ip_bytes-obj.orig_bytes);
             if (obj.resp_bytes >100000000) {
                 if (obj.duration<1) {
-                    log.error("Conn:Burst:Drop",obj);
+                    log.debug("Conn:Burst:Drop",obj);
                     return;
                 }
                 let rate = obj.resp_bytes/obj.duration;
                 if (rate>20000000) {
-                    log.error("Conn:Burst:Drop",rate,obj);
+                    log.debug("Conn:Burst:Drop",rate,obj);
                     return;
                 }
                 let packet = obj.resp_bytes/obj.resp_pkts;
                 if (packet >10000000) {
-                    log.error("Conn:Burst:Drop2",packet,obj);
+                    log.debug("Conn:Burst:Drop2",packet,obj);
                     return;
                 }
             }
+
+
             if (obj.orig_bytes >100000000) {
                 if (obj.duration<1) {
-                    log.error("Conn:Burst:Drop:Orig",obj);
+                    log.debug("Conn:Burst:Drop:Orig",obj);
                     return;
                 }
                 let rate = obj.orig_bytes/obj.duration;
                 if (rate>20000000) {
-                    log.error("Conn:Burst:Drop:Orig",rate,obj);
+                    log.debug("Conn:Burst:Drop:Orig",rate,obj);
                     return;
                 }
                 let packet = obj.orig_bytes/obj.orig_pkts;
                 if (packet >10000000) {
-                    log.error("Conn:Burst:Drop2:Orig",packet,obj);
+                    log.debug("Conn:Burst:Drop2:Orig",packet,obj);
                     return;
                 }
             }
@@ -635,6 +703,12 @@ module.exports = class {
                 } else {
                     log.debug("Conn:Adjusted:MissedBytes",obj.conn_state,obj);
                 }
+            }
+
+            if ((obj.orig_bytes>obj.orig_ip_bytes || obj.resp_bytes>obj.resp_ip_bytes) && obj.proto == "tcp") {
+                log.debug("Conn:Burst:Adjust1",obj);
+                obj.orig_bytes = obj.orig_ip_bytes;
+                obj.resp_bytes = obj.resp_ip_bytes;
             }
 
             /*
@@ -679,7 +753,7 @@ module.exports = class {
                     return;
                 }
             } catch (e) {
-                log.error("Conn:Data:Error checking ulticast", e);
+                log.debug("Conn:Data:Error checking ulticast", e);
                 return;
             }
 
@@ -702,7 +776,7 @@ module.exports = class {
                 flowdir = "out";
                 lhost = dst;
             } else {
-                log.error("Conn:Error:Drop", data, host, dst, sysManager.isLocalIP(host), sysManager.isLocalIP(dst));
+                log.debug("Conn:Error:Drop", data, host, dst, sysManager.isLocalIP(host), sysManager.isLocalIP(dst));
                 return;
             }
 
@@ -749,6 +823,9 @@ module.exports = class {
             // Warning for long running tcp flows, the conn structure logs the ts as the
             // first packet.  when this happens, if the flow started a while back, it
             // will get summarize here
+            //if (host == "192.168.2.164" || dst == "192.168.2.164") {
+            //    log.error("Conn:192.168.2.164:",JSON.stringify(obj),null);
+            // }
 
             let now = Math.ceil(Date.now() / 1000);
             let flowspecKey = host + ":" + dst + ":" + flowdir;
@@ -871,21 +948,47 @@ module.exports = class {
             if (tmpspec) {
                 let key = "flow:conn:" + tmpspec.fd + ":" + tmpspec.lh;
                 let strdata = JSON.stringify(tmpspec);
+
+            //     totalInBytes+=Number(o.rb);
+            //     totalOutBytes+=Number(o.ob);
+            //     this.recordStats(ip,"hour",o.ts,Number(o.rb),Number(o.ob),null);
+            // } else {
+            //     totalInBytes+=Number(o.ob);
+            //     totalOutBytes+=Number(o.rb);
+                
+            // not sure to use tmpspec.ts or now???
+                if(tmpspec.fd == 'in') {
+                  // use now instead of the start time of this flow
+                  this.recordTraffic(new Date() / 1000, tmpspec.rb, tmpspec.ob)
+                  //this.recordTraffic(tmpspec.ts, tmpspec.rb, tmpspec.ob)
+                } else {
+                  this.recordTraffic(new Date() / 1000, tmpspec.ob, tmpspec.rb)
+                  //this.recordTraffic(tmpspec.ts, tmpspec.ob, tmpspec.rb)
+                }
+                    
+
                 //let redisObj = [key, tmpspec.ts, strdata];
                 let redisObj = [key, now, strdata];
                 log.debug("Conn:Save:Temp", redisObj);
+
+
                 rclient.zadd(redisObj, (err, response) => {
                     if (err == null) {
 
                       let remoteIPAddress = (tmpspec.lh === tmpspec.sh ? tmpspec.dh : tmpspec.sh);
 
+
+
                       setTimeout(() => {
                         sem.emitEvent({
                           type: 'DestIPFound',
                           ip: remoteIPAddress,
+                          fd: tmpspec.fd,
+                          ob: tmpspec.ob,
+                          rb: tmpspec.rb,
                           suppressEventLogging: true
                         });
-                      }, 15 * 1000); // send out in 15 seconds
+                      }, 1 * 1000); // make it a little slower so that dns record will be handled first
 
 
                         if (this.config.bro.conn.expires) {
@@ -1205,6 +1308,10 @@ module.exports = class {
       if(obj["san.dns"] && obj["san.dns"].constructor === Array) {
         obj["san.dns"] = JSON.stringify(obj["san.dns"]);
       }
+
+      if(obj["san.ip"] && obj["san.ip"].constructor === Array) {
+        obj["san.ip"] = JSON.stringify(obj["san.ip"]);
+      }
     }
 
 /*
@@ -1426,7 +1533,7 @@ module.exports = class {
 //                log.error("Notice:Drop My IP", obj);
                 return;
             }
-            log.info("Notice:Processing",obj);
+            log.debug("Notice:Processing",obj);
             if (this.config.bro.notice.ignore[obj.note] == null) {
                 let strdata = JSON.stringify(obj);
                 let key = "notice:" + obj.src;
@@ -1465,60 +1572,55 @@ module.exports = class {
                      obj: obj
                 };
 
-                dnsManager.resolvehost(obj.src,(err,__src)=>{
-                    dnsManager.resolvehost(obj.dst,(err,__dst)=>{
-                      actionobj.shname =dnsManager.name(__src);
-                      actionobj.dhname =dnsManager.name(__dst);
+                (async () => {
+                    const srcName = await hostTool.getName(obj.src)
+                    const dstName = await hostTool.getName(obj.dst)
+                    if(srcName) {
+                        actionobj.shname = srcName
+                    }
+                    if(dstName) {
+                        actionobj.dhname = dstName
+                    }
 
-                      let localIP = lh;
-                      let message = obj.msg;
-                      let noticeType = obj.note;
-                      let timestamp = parseFloat(obj.ts);
+                    let localIP = lh;
+                    let message = obj.msg;
+                    let noticeType = obj.note;
+                    let timestamp = parseFloat(obj.ts);
 
-                      // TODO: create dedicate alarm type for each notice type
-                      let alarm = new Alarm.BroNoticeAlarm(timestamp, localIP, noticeType, message, {
-                        "p.device.ip": localIP,
-                        "p.dest.ip": dh
-                      });
+                    // TODO: create dedicate alarm type for each notice type
+                    let alarm = new Alarm.BroNoticeAlarm(timestamp, localIP, noticeType, message, {
+                      "p.device.ip": localIP,
+                      "p.dest.ip": dh
+                    });
 
-                      if(noticeType == 'SSH::Password_Guessing') {
-                        const subMessage = obj.sub
-                        // sub message:
-                        //   Sampled servers:  10.0.1.182, 10.0.1.182, 10.0.1.182, 10.0.1.182, 10.0.1.182
-                        
-                        let addresses = subMessage.replace(/.*Sampled servers:  /, '').split(", ")
-                        addresses = addresses.filter((v, i, array) => {
-                          return array.indexOf(v) === i
-                        })
+                    if(noticeType == 'SSH::Password_Guessing') {
+                      const subMessage = obj.sub
+                      // sub message:
+                      //   Sampled servers:  10.0.1.182, 10.0.1.182, 10.0.1.182, 10.0.1.182, 10.0.1.182
+                      
+                      let addresses = subMessage.replace(/.*Sampled servers:  /, '').split(", ")
+                      addresses = addresses.filter((v, i, array) => {
+                        return array.indexOf(v) === i
+                      })
 
-                        if(addresses.length > 0) {
-                          alarm["p.device.ip"] = addresses[0]
-                          alarm["p.device.name"] = addresses[0] // workaround, app side should use mac address to convert
+                      if(addresses.length > 0) {
+                        const ip = addresses[0];
+                        alarm["p.device.ip"] = ip;
+                        alarm["p.device.name"] = ip;
+                        const mac = await hostTool.getMacByIP(ip);
+                        if(mac) {
+                          alarm["p.device.mac"] = mac;
                         }
-
-                        alarm["p.message"] = `${alarm["p.message"].replace(/\.$/, '')} on device: ${addresses.join(",")}`
                       }
 
-                      async(() => {
-                        if(alarm["p.dest.ip"] && alarm["p.dest.ip"] != "0.0.0.0") {
-                          await (am2.enrichDestInfo(alarm))
-                        }
-                        await (am2.enrichDeviceInfo(alarm))
-                        am2.checkAndSave(alarm, (err) => {
-                          if(err) {
-                            log.error("Failed to save alarm: " + err);
-                          }
-                        });
-                      })()
+                      alarm["p.message"] = `${alarm["p.message"].replace(/\.$/, '')} on device: ${addresses.join(",")}`
+                    }
 
-                      alarmManager.alarm(lh, "notice", 'info', '0', {"msg":obj.msg}, actionobj, (err,obj,action)=> {
-                        // if (obj != null) {
-                        //          this.publisher.publish("DiscoveryEvent", "Notice:Detected", lh, obj);
-                        // }
-                      });
-                    });
-                });
-
+                    am2.enqueueAlarm(alarm);
+                    
+                })().catch((err) => {
+                    log.error("Failed to generate alarm:", err, {})
+                })
             } else {
 //              log.info("Notice:Drop> Notice type " + obj.note + " is ignored");
             }
@@ -1530,5 +1632,89 @@ module.exports = class {
     on(something, callback) {
         this.callbacks[something] = callback;
     }
+
+
+    // recordHit(data) {
+    //     const ts = Math.floor(data.ts)
+    //     const inBytes = data.inBytes
+    //     const outBytes = data.outBytes
+    
+    //     timeSeries
+    //     .recordHit('download',ts, Number(inBytes))
+    //     .recordHit('upload',ts, Number(outBytes))
+    // }
+
+    //   recordManyHits(datas) {
+    //       datas.forEach((data) => {
+    //         const ts = Math.floor(data.ts)
+    //         const inBytes = data.inBytes
+    //         const outBytes = data.outBytes
+
+    //         timeSeries.recordHit('download',ts, Number(inBytes))
+    //         timeSeries.recordHit('upload',ts, Number(outBytes))
+    //       })
+
+    //       return new Promise((resolve, reject) => {
+    //         timeSeries.exec(() => {
+    //             resolve()
+    //         })
+    //       })
+    //   }
+    
+      enableRecordHitsTimer() {
+          setInterval(() => {
+            timeSeries.exec(() => {})
+            this.cc = 0
+          }, 1 * 60 * 1000) // every minute to record the left-over items if no new flows
+      }
+    
+    //   recordHits() {
+    //     if(this.recordCache && this.recordCache.length > 0 && this.recording == false) {
+    //         this.recording = true
+    //         const copy = JSON.parse(JSON.stringify(this.recordCache))
+    //         this.recordCache = []
+    //         async(() => {
+    //             await(this.recordManyHits(copy))
+    //         })().finally(() => {
+    //             this.recording = false
+    //         })
+    //     } else {
+    //         if(this.recording) {
+    //             log.info("still recording......")
+    //         }
+    //     }
+    //   }
+
+      recordTraffic(ts, inBytes, outBytes) {
+          if(this.recordCache && this.enableRecording) {
+
+            let normalizedTS = Math.floor(Math.floor(Number(ts)) / 10) // only record every 10 seconds
+                                    
+            if(!this.lastNTS) {
+                this.lastNTS = normalizedTS
+                this.fullLastNTS = Math.floor(ts)
+                this.lastNTS_download = 0
+                this.lastNTS_upload = 0
+            }
+
+            if(this.lastNTS == normalizedTS) {
+                // append current status
+                this.lastNTS_download += Number(inBytes)
+                this.lastNTS_upload += Number(outBytes)
+
+            } else {
+                log.debug("Store timeseries", this.fullLastNTS, this.lastNTS_download, this.lastNTS_upload)
+
+                timeSeries
+                .recordHit('download',this.fullLastNTS, this.lastNTS_download)
+                .recordHit('upload',this.fullLastNTS, this.lastNTS_upload)
+                .exec()
+                
+                this.lastNTS = null
+
+                this.recordTraffic(ts, inBytes, outBytes)
+            }           
+          }
+      }
 
 }

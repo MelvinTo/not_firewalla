@@ -34,9 +34,7 @@ let networkTool = require('../net2/NetworkTool')();
 
 let license = require('../util/license.js');
 
-const redis = require('redis')
-const rclient = redis.createClient()
-Promise.promisifyAll(redis.RedisClient.prototype);
+const rclient = require('../util/redis_manager.js').getRedisClient()
 
 let FW_SERVICE = "Firewalla";
 let FW_SERVICE_TYPE = "fb";
@@ -97,6 +95,16 @@ class FWInvitation {
     log.info("\n");
     qrcode.generate(license)
   }
+
+  displayBonjourMessage(msg) {
+    if(!msg)
+      return
+
+    log.info("\n\n-------------------------------\n");
+    log.info("\n\nBonjour Message QR");
+    log.info("\n");
+    qrcode.generate(JSON.stringify(msg))
+  }
   
   validateLicense(license) {
 
@@ -104,7 +112,7 @@ class FWInvitation {
 
   checkInvitation(rid) {
     return async(() => {
-      log.info(`${this.leftCheckCount} Inviting ${rid} to group ${this.gid}`);
+      log.forceInfo(`${this.leftCheckCount} Inviting ${rid} to group ${this.gid}`);
       try {
         this.leftCheckCount--;
         let rinfo = await (this.cloud.eptinviteGroupByRidAsync(this.gid, rid));
@@ -209,6 +217,10 @@ class FWInvitation {
         'licensemode': '1',
     };
 
+    if(this.diag) {
+      this.diag.broadcastInfo = txtfield
+    }
+
     if (intercomm.bcapable()==false) {
       txtfield.verifymode = "qr";
     } else {
@@ -230,6 +242,7 @@ class FWInvitation {
 
         log.info("TXT:", txtfield, {});
         this.service = intercomm.publish(null, FW_ENDPOINT_NAME + utils.getCpuId(), 'devhi', 8833, 'tcp', txtfield);
+        this.displayBonjourMessage(txtfield)
     });
 
     if (intercomm.bcapable() != false) {

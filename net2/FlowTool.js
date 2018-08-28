@@ -16,12 +16,8 @@
 
 let log = require('./logger.js')(__filename);
 
-let redis = require('redis');
-let rclient = redis.createClient();
-
+const rclient = require('../util/redis_manager.js').getRedisClient()
 let Promise = require('bluebird');
-Promise.promisifyAll(redis.RedisClient.prototype);
-Promise.promisifyAll(redis.Multi.prototype);
 
 let async = require('asyncawait/async');
 let await = require('asyncawait/await');
@@ -155,7 +151,7 @@ class FlowTool {
       log.error("Host:Flows:Sorting:Parsing", flow);
       return false;
     }
-    if ( !o.rb || !o.ob ) {
+    if ( !('rb' in o) || !('ob' in o) ) {
       return false
     }
     if (o.rb === 0 && o.ob === 0) {
@@ -179,37 +175,6 @@ class FlowTool {
     }
   }
 
-  // FIXME: support dynamically load intel from cloud
-  _enrichDNSInfo(flows) {
-
-    return new Promise((resolve, reject) => {
-      async.eachLimit(flows, MAX_CONCURRENT_ACTIVITY, (flow, cb) => {
-        let ip = this._getRemoteIP(flow);
-
-        dnsManager.resolvehost(ip, (err, info, dnsData) => {
-          if (err) {
-            cb(err);
-            return;
-          }
-
-          if (info && info.name) {
-            flow.dhname = info.name;
-          }
-
-          cb();
-        });
-      }, (err) => {
-        if(err) {
-          reject(err);
-          return;
-        }
-
-        resolve(flows);
-      });
-    });
-
-  }
-
   prepareRecentFlows(json, options) {
     options = options || {}
 
@@ -221,9 +186,18 @@ class FlowTool {
 
     return async(() => {
 
-      let flows = await(this.getAllRecentOutgoingConnections(options));
+      let flows = await(this.getAllRecentOutgoingConnections(options))
       flows = flows.slice(0, MAX_RECENT_FLOW);
+
+      let flows2 = await(this.getAllRecentIncomingConnections(options))
+      flows2 = flows2.slice(0, MAX_RECENT_FLOW);
+
       Array.prototype.push.apply(json.flows.recent, flows);
+      Array.prototype.push.apply(json.flows.recent, flows2);
+
+      json.flows.recent.sort((a, b) => {
+        return b.ts - a.ts;
+      })
     })();
   }
 
@@ -243,6 +217,12 @@ class FlowTool {
           f.device = mac;
         });
         allFlows.push.apply(allFlows, flows);
+
+        let flows2 = await(this.getRecentIncomingConnections(ip, options));
+        flows2.forEach((f) => {
+          f.device = mac;
+        });
+        allFlows.push.apply(allFlows, flows2);
       })
 
       allFlows.sort((a, b) => {
@@ -296,52 +276,6 @@ class FlowTool {
     return f;
   }
 
-  legacyGetRecentOutgoingConnections(ip) {
-
-     let key = "flow:conn:in:" + ip;
-     let to = new Date() / 1000;
-     let from = to - MAX_RECENT_INTERVAL;
-
-     return rclient.zrevrangebyscoreAsync([key, to, from, "LIMIT", 0 , MAX_RECENT_FLOW])
-       .then((results) => {
-
-         if(results === null || results.length === 0)
-           return [];
-
-         let flowObjects = results
-           .map((x) => this._flowStringToJSON(x))
-           .filter((x) => this._isFlowValid(x));
-
-         flowObjects.forEach((x) => this.trimFlow(x));
-
-         let mergedFlowObjects = [];
-         let lastFlowObject = null;
-
-         flowObjects.forEach((flowObject) => {
-           if(!lastFlowObject) {
-             mergedFlowObjects.push(flowObject);
-             lastFlowObject = flowObject;
-             return;
-           }
-
-           if (this._getKey(lastFlowObject) === this._getKey(flowObject)) {
-             this._mergeFlow(lastFlowObject, flowObject);
-           } else {
-             mergedFlowObjects.push(flowObject);
-             lastFlowObject = flowObject;
-           }
-         });
-
-         // add country info
-         mergedFlowObjects.forEach(this._enrichCountryInfo);
-
-         return this._enrichDNSInfo(mergedFlowObjects);
-
-       }).catch((err) => {
-         log.error("Failed to query flow data for ip", ip, ":", err, err.stack, {});
-       });
-   }
-
   getRecentOutgoingConnections(ip, options) {
     return this.getRecentConnections(ip, "in", options)
   }
@@ -357,6 +291,53 @@ class FlowTool {
 
   getAllRecentIncomingConnections(options) {
     return this.getAllRecentConnections("out", options);
+  }
+
+  getAllRecentOutgoingConnectionsMixed(options) {
+    return async(() => {
+
+    //   {
+    //     country = US;
+    //     device = "9C:3D:CF:FA:95:75";
+    //     download = 11984;
+    //     duration = "1.121203";
+    //     fd = in;
+    //     host = "logs.us-west-2.amazonaws.com";
+    //     ip = "52.94.209.50";
+    //     ts = "1519653614.804147";
+    //     upload = 1392;
+    // }
+
+      const outgoing = await (this.getAllRecentOutgoingConnections(options))
+      const incoming = await (this.getAllRecentIncomingConnections(options))
+
+      const all = outgoing.concat(incoming)
+
+      all.sort((a, b) => a.ip < b.ip)      
+      
+      let merged = []
+      let last_entry = null
+
+      for (let i = 0; i < all.length; i++) {
+        const entry = all[i];
+        if(last_entry === null) {
+          last_entry = entry
+        } else {
+          if(last_entry.ip === entry.ip) {
+            last_entry.upload += entry.upload
+            last_entry.download += entry.download
+            last_entry.duration = parseFloat(last_entry.duration) + parseFloat(entry.duration)
+          } else {
+            merged.push(last_entry)
+            last_entry = entry
+          }
+        }
+      }
+
+      merged.push(last_entry)      
+
+      return merged
+    })()
   }
 
   // this is to get all recent connections in the network
@@ -393,6 +374,94 @@ class FlowTool {
 
       return allFlows;
     })();
+  }
+
+  _aggregateTransferBy10Min(results) {
+    const aggrResults = {};
+    results.forEach((x) => {
+      const ts = x.ts;
+      const tenminTS = Math.floor(Number(ts) / 600) * 600;
+      if(!aggrResults[tenminTS]) {
+        aggrResults[tenminTS] = {
+          ts: tenminTS,
+          ob: x.ob,
+          rb: x.rb
+        }
+      } else {
+        const old = aggrResults[tenminTS];
+        aggrResults[tenminTS] = {
+          ts: tenminTS,
+          ob: x.ob + old.ob,
+          rb: x.rb + old.rb
+        }
+      }
+    })
+    return Object.values(aggrResults).sort((x,y) => {
+      if(x.ts > y.ts) {
+        return 1;
+      } else if(x.ts === y.ts) {
+        return 0;
+      } else {
+        return -1;
+      }
+    });
+  }
+
+  async _getTransferTrend(ip, destinationIP, options) {
+    options = options || {};
+    const end = options.end || Math.floor(new Date() / 1000);
+    const begin = options.begin || end - 3600 * 6; // 6 hours
+    const direction = options.direction || 'in';
+    
+    const key = util.format("flow:conn:%s:%s", direction, ip);
+
+    const results = await rclient.zrangebyscoreAsync([key, begin, end]);
+
+    if(results === null || results.length === 0) {
+      return [];
+    }
+
+    const list = results
+    .map((jsonString) => {
+      try {
+        return JSON.parse(jsonString);        
+      } catch(err) {
+        log.error(`Failed to parse json string: ${jsonString}, err: ${err}`);
+        return null;
+      }      
+    })
+    .filter((x) => x !== null)
+    .filter((x) => x.sh === destinationIP || x.dh === destinationIP)
+    .map((x) => {
+      return {
+        ts: x.ts,
+        ob: x.ob,
+        rb: x.rb
+      }
+    })
+
+    return list;
+  }
+
+  async getTransferTrend(deviceMAC, destinationIP, options) {
+    options = options || {};
+    
+    const results = await hostTool.getIPsByMac(deviceMAC);
+
+    const transfers = [];
+
+    for (let index = 0; index < results.length; index++) {
+      const ip = results[index];
+      const t_in = await this._getTransferTrend(ip, destinationIP, options);
+      transfers.push.apply(transfers, t_in);
+
+      const optionsCopy = JSON.parse(JSON.stringify(options));
+      optionsCopy.direction = 'out';
+      const t_out = await this._getTransferTrend(ip, destinationIP, optionsCopy);
+      transfers.push.apply(transfers, t_out);
+    }
+
+    return this._aggregateTransferBy10Min(transfers);
   }
 
   getRecentConnections(ip, direction, options) {

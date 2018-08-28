@@ -18,8 +18,7 @@
 let log = require('../net2/logger.js')(__filename, 'info');
 let Alarm = require('./Alarm.js');
 
-let redis = require('redis');
-let rclient = redis.createClient();
+const rclient = require('../util/redis_manager.js').getRedisClient()
 
 var bone = require("../lib/Bone.js");
 
@@ -33,15 +32,17 @@ const await = require('asyncawait/await');
 
 const fc = require('../net2/config.js')
 
+const f = require('../net2/Firewalla.js');
+
 const Promise = require('bluebird');
-Promise.promisifyAll(redis.RedisClient.prototype);
-Promise.promisifyAll(redis.Multi.prototype);
 
-let IM = require('../net2/IntelManager.js')
-let im = new IM('info');
+const IntelManager = require('../net2/IntelManager.js')
+const intelManager = new IntelManager('info');
 
-var DNSManager = require('../net2/DNSManager.js');
-var dnsManager = new DNSManager('info');
+const DNSManager = require('../net2/DNSManager.js');
+const dnsManager = new DNSManager('info');
+
+const getPreferredBName = require('../util/util.js').getPreferredBName
 
 let Policy = require('./Policy.js');
 
@@ -72,7 +73,10 @@ let extend = require('util')._extend;
 
 let fConfig = require('../net2/config.js').getConfig();
 
-let AUTO_BLOCK_THRESHOLD = 10;
+const DNSTool = require('../net2/DNSTool.js')
+const dnsTool = new DNSTool()
+
+const Queue = require('bee-queue')
 
 function formatBytes(bytes,decimals) {
   if(bytes == 0) return '0 Bytes';
@@ -90,8 +94,60 @@ module.exports = class {
     if (instance == null) {
       instance = this;
       this.publisher = new c('info');
+
+      this.setupAlarmQueue();
     }
     return instance;
+  }
+
+  setupAlarmQueue() {
+
+    this.queue = new Queue(`alarm-${f.getProcessName()}`, {
+      removeOnFailure: true,
+      removeOnSuccess: true
+    })
+
+    this.queue.on('error', (err) => {
+      log.error("Queue got err:", err)
+    })
+
+    this.queue.on('failed', (job, err) => {
+      log.error(`Job ${job.id} ${job.name} failed with error ${err.message}`);
+    });
+
+    this.queue.destroy(() => {
+      log.info("alarm queue is cleaned up")
+    })
+
+    this.queue.process((job, done) => {
+      const event = job.data;
+      const alarm = this.jsonToAlarm(event.alarm);
+      const action = event.action;
+      
+      switch(action) {
+      case "create": {
+        (async () => {
+          try {
+            log.info("Try to create alarm:", event.alarm);
+            await this.checkAndSaveAsync(alarm);
+            log.info(`Alarm ${alarm.aid} is created successfully`);
+          } catch(err) {
+            log.error("failed to create alarm:" + err);
+          }
+
+          log.info("complete alarm creation process", alarm.aid, {});
+          done();          
+        })();
+
+        break
+      }
+
+      default:
+        log.error("unrecoganized policy enforcement action:" + action)
+        done()
+        break
+      }
+    })
   }
 
   createAlarmIDKey(callback) {
@@ -200,8 +256,8 @@ module.exports = class {
         return
       }
 
-      alarm.result = "ignore"
-      await (this.updateAlarm(alarm))
+      // alarm.result = "ignore"
+      // await (this.updateAlarm(alarm))
       await (this.archiveAlarm(alarm.aid))
     })()
   }
@@ -227,7 +283,8 @@ module.exports = class {
           alarmID: alarm.aid,
           aid: alarm.aid,
           alarmNotifType:alarm.notifType,
-          alarmType: alarm.type
+          alarmType: alarm.type,
+          testing: alarm["p.monkey"]
         };
 
         if(alarm.result_method === "auto") {
@@ -241,7 +298,24 @@ module.exports = class {
 
       }).catch((err) => Promise.reject(err));
   }
+  
+  // exclude extended info from basic info, these two info will be stored separately 
+  
+  parseRawAlarm(alarm) {
+    const alarmCopy = JSON.parse(JSON.stringify(alarm));
+    const keys = Object.keys(alarmCopy);
+    const extendedInfo = {};    
 
+    keys.forEach((key) => {
+      if(key.startsWith("e.") || key.startsWith("r.")) {
+        extendedInfo[key] = alarmCopy[key];
+        delete alarmCopy[key];
+      }
+    });
+    
+    return {basic: alarmCopy, extended: extendedInfo};
+  }
+  
   saveAlarm(alarm, callback) {
     callback = callback || function() {}
 
@@ -255,8 +329,12 @@ module.exports = class {
       alarm.aid = id + ""; // covnert to string to make it consistent
 
       let alarmKey = alarmPrefix + id;
+      
+      const flatted = flat.flatten(alarm);
+      
+      const {basic, extended} = this.parseRawAlarm(flatted);
 
-      rclient.hmset(alarmKey, flat.flatten(alarm), (err) => {
+      rclient.hmset(alarmKey, basic, (err) => {
         if(err) {
           log.error("Failed to set alarm: " + err);
           callback(err);
@@ -270,9 +348,23 @@ module.exports = class {
           if(!err) {
             audit.trace("Created alarm", alarm.aid, "-", alarm.type, "on", alarm.device, ":", alarm.localizedMessage());
 
+            // add extended info, extended info are optional
+            (async () => {
+              const extendedAlarmKey = `_alarmDetail:${alarm.aid}`;
+              
+              // if there is any extended info
+              if(Object.keys(extended).length !== 0 && extended.constructor === Object) {
+                await rclient.hmsetAsync(extendedAlarmKey, extended);
+                await rclient.expireatAsync(extendedAlarmKey, parseInt((+new Date) / 1000) + expiring);
+              }
+              
+            })().catch((err) => {
+              log.error(`Failed to store extended data for alarm ${alarm.aid}, err: ${err}`);
+            })
+            
             setTimeout(() => {
               this.notifAlarm(alarm.aid);
-            }, 3000);
+            }, 1000);
           }
 
           callback(err, alarm.aid);
@@ -294,7 +386,12 @@ module.exports = class {
 
   dedup(alarm) {
     return new Promise((resolve, reject) => {
-      this.loadRecentAlarms((err, existingAlarms) => {
+      let duration = 15 * 60 // 15 minutes
+      if(alarm.type === 'ALARM_LARGE_UPLOAD') {
+        duration = 60 * 60 * 4 // for upload activity, only generate one alarm per 4 hour.
+      }
+      
+      this.loadRecentAlarms(duration, (err, existingAlarms) => {
         if(err) {
           reject(err);
           return;
@@ -313,6 +410,16 @@ module.exports = class {
     });
   }
 
+  enqueueAlarm(alarm) {
+    if(this.queue) {
+      const job = this.queue.createJob({
+        alarm: alarm,
+        action: "create"
+      })
+      job.timeout(60000).save(function() {})
+    }
+  }
+
   checkAndSaveAsync(alarm) {
     return new Promise((resolve, reject) => {
       this.checkAndSave(alarm, (err, alarmID) => {
@@ -326,14 +433,49 @@ module.exports = class {
   }
 
   checkAndSave(alarm, callback) {
+    callback = callback || function() {};
+
+    (async () => {
+
+      const il = require('../intel/IntelLoader.js');
+
+      alarm = await il.enrichAlarm(alarm);
+
+      let verifyResult = this.validateAlarm(alarm);
+      if(!verifyResult) {
+        callback(new Error("invalid alarm, failed to pass verification"));
+        return;
+      }
+
+      const result = await bone.arbitration(alarm);
+
+      if(!result) {
+        callback(new Error("invalid alarm, failed to pass cloud verification"));
+        return;
+      }
+
+      alarm = this.jsonToAlarm(result);
+
+      if(!alarm) {
+        callback(new Error("invalid alarm json from cloud"));
+        return;
+      }
+
+      if(alarm["p.cloud.decision"] && alarm["p.cloud.decision"] === 'ignore') {
+        log.info(`Alarm is ignored by cloud: ${alarm}`);
+        callback(null, 0);
+      } else {
+        if(alarm["p.cloud.decision"] && alarm["p.cloud.decision"] === 'block') {
+          log.info(`Decison from cloud is auto-block`, alarm.type, alarm["p.device.ip"], alarm["p.dest.ip"]);
+        }
+        this._checkAndSave(alarm, callback);
+      }
+    })();
+  }
+
+  _checkAndSave(alarm, callback) {
     callback = callback || function() {}
     
-    let verifyResult = this.validateAlarm(alarm);
-    if(!verifyResult) {
-      callback(new Error("invalid alarm, failed to pass verification"));
-      return;
-    }
-
     // disable this check for now, since we use new way to check feature enable/disable
     // let enabled = this.isAlarmTypeEnabled(alarm)
     // if(!enabled) {
@@ -341,13 +483,24 @@ module.exports = class {
     //   return
     // }
 
+    // HACK, update rdns if missing, sometimes intel contains ip => domain, but rdns entry is missing
+    const destName = alarm["p.dest.name"]
+    const destIP = alarm["p.dest.ip"]
+    if(destName && destIP && destName !== destIP) {
+      dnsTool.addReverseDns(destName, [destIP])
+    }
+    
+    log.info("Checking if similar alarms are generated recently");
+    
     let dedupResult = this.dedup(alarm).then((dup) => {
 
       if(dup) {
         log.warn("Same alarm is already generated, skipped this time");
         log.warn("destination: " + alarm["p.dest.name"] + ":" + alarm["p.dest.ip"]);
         log.warn("source: " + alarm["p.device.name"] + ":" + alarm["p.device.ip"]);
-        callback(new Error("duplicated with existing alarms"));
+        let err = new Error("duplicated with existing alarms");
+        err.code = 'ERR_DUP_ALARM';
+        callback(err);
         return;
       }
 
@@ -375,7 +528,10 @@ module.exports = class {
 
           if(result) {
             // already matched some policy
-            callback(new FWError("alarm is covered by policies", 2))
+
+            const err2 = new Error("alarm is covered by policies");
+            err2.code = 'ERR_BLOCKED_BY_POLICY_ALREADY';
+            callback(new FWError(err2))
             return
           }
 
@@ -387,13 +543,19 @@ module.exports = class {
 
             if(alarm.type === "ALARM_INTEL") {
               log.info("AlarmManager:Check:AutoBlock",alarm);
-              let num = parseInt(alarm["p.security.numOfReportSources"]);
               if(fConfig && fConfig.policy &&
                  fConfig.policy.autoBlock &&
                  fc.isFeatureOn("cyber_security.autoBlock") &&
-                 num > AUTO_BLOCK_THRESHOLD || (alarm["p.action.block"] && alarm["p.action.block"]==true)) {
+                 (alarm["p.action.block"] && alarm["p.action.block"]==true)) {
+
                 // auto block if num is greater than the threshold
-                this.blockFromAlarm(alarm.aid, {method: "auto"}, callback);
+                this.blockFromAlarm(alarm.aid, {
+                  method: "auto", 
+                  info: {
+                    category: alarm["p.dest.category"] || ""
+                  }
+                }, callback)
+
                 if (alarm['p.dest.ip']) {
                   alarm["if.target"] = alarm['p.dest.ip'];
                   alarm["if.type"] = "ip";
@@ -572,6 +734,11 @@ module.exports = class {
     });
   }
 
+  async numberOfArchivedAlarms() {
+    const count = await rclient.zcountAsync(alarmArchiveKey, "-inf", "+inf");
+    return count;
+  }
+
   // top 50 only by default
   loadActiveAlarms(number, callback) {
 
@@ -614,7 +781,22 @@ module.exports = class {
       })
     })
   }
+  
+  async getAlarmDetail(aid) {
+    const prefix = "_alarmDetail";
+    const key = `${prefix}:${aid}`
+    const detail = await rclient.hgetallAsync(key);
+    if(detail) {
+      for(let key in detail) {
+        if(key.startsWith("r.")) {
+          delete detail[key];
+        }
+      }
+    }
 
+    return detail;    
+  }
+  
   // parseDomain(alarm) {
   //   if(!alarm["p.dest.name"] ||
   //      alarm["p.dest.name"] === alarm["p.dest.ip"]) {
@@ -631,7 +813,7 @@ module.exports = class {
 
   findSimilarAlarmsByPolicy(policy, curAlarmID) {
     return async(() => {
-      let alarms = await (this.loadActiveAlarmsAsync())
+      let alarms = await (this.loadActiveAlarmsAsync(200)) // load 200 alarms for comparison
       return alarms.filter((alarm) => {
         if(alarm.aid === curAlarmID) {
           return false // ignore current alarm id, since it's already blocked
@@ -752,7 +934,10 @@ module.exports = class {
             i_target = alarm["p.device.mac"];
             break;
           case "ALARM_BRO_NOTICE":
-            if(alarm["p.noticeType"] && alarm["p.noticeType"] == "SSH::Password_Guessing") {
+            if(alarm["p.noticeType"] && alarm["p.noticeType"] === "SSH::Password_Guessing") {
+              i_type = "ip"
+              i_target = alarm["p.dest.ip"]
+            } else if(alarm["p.noticeType"] && alarm["p.noticeType"] === "Scan::Port_Scan") {
               i_type = "ip"
               i_target = alarm["p.dest.ip"]
             } else {
@@ -762,10 +947,18 @@ module.exports = class {
             }
             break;
           default:
+
+          if(alarm["p.dest.name"] ===  alarm["p.dest.ip"]) {
             i_type = "ip";
             i_target = alarm["p.dest.ip"];
+          } else {
+            i_type = "dns";
+            i_target = alarm["p.dest.name"];
+          }
+
 
             if(intelFeedback) {
+
               switch(intelFeedback.type) {
                 case "dns":
                 case "domain":
@@ -776,6 +969,10 @@ module.exports = class {
                   i_type = "ip"
                   i_target = intelFeedback.target
                   break
+                case "category":
+                  i_type = "category";
+                  i_target = intelFeedback.target;
+                  break;
                 default:
                   break
               }
@@ -796,8 +993,19 @@ module.exports = class {
           reason: alarm.type,
           "if.type": i_type,
           "if.target": i_target,
+          category: (intelFeedback && intelFeedback.category) || ""
         });
 
+        if(intelFeedback) {
+          if(intelFeedback.type === 'dns' && intelFeedback.exactMatch == true) {
+            p.domainExactMatch = "1";
+          }
+        } else {
+          if(i_type === 'dns') {
+            p.domainExactMatch = "1"; // by default enable domain exact match
+          }
+        }
+        
         // add additional info
         switch(i_type) {
         case "mac":
@@ -812,12 +1020,20 @@ module.exports = class {
           p.target_name = alarm["p.dest.name"] || alarm["p.dest.ip"];
           p.target_ip = alarm["p.dest.ip"];
           break;
+        case "category":
+          p.target_name = alarm["p.dest.category"];
+          p.target_ip = alarm["p.dest.ip"];
+          break;
         default:
           break;
         }
 
         if(info.method) {
           p.method = info.method;
+        }
+
+        if(intelFeedback && intelFeedback.device) {
+          p.scope = [intelFeedback.device];
         }
 
         log.info("Policy object:", p, {});
@@ -835,45 +1051,40 @@ module.exports = class {
               alarm.result_method = "auto";
             }
 
-            this.updateAlarm(alarm)
-              .then(() => {
-                // archive alarm
+            async(() => {
+              await (this.updateAlarm(alarm))
+              
+              if(alarm.result_method != "auto") {                
+                // archive alarm unless it's auto block
+                await (this.archiveAlarm(alarm.aid))
+              }
 
-                this.archiveAlarm(alarm.aid)
-                  .then(() => {
+              // // old way
+              // if(!info.matchAll) {
+              //   callback(null, policy)
+              //   return
+              // }
 
-                    // old way
-                    if(!info.matchAll) {
-                      callback(null, policy)
-                      return
-                    }
+              log.info("Trying to find if any other active alarms are covered by this new policy")
+              let alarms = await (this.findSimilarAlarmsByPolicy(p, alarm.aid))
+              if(alarms && alarms.length > 0) {
+                let blockedAlarms = []
+                alarms.forEach((alarm) => {
+                  try {
+                    await (this.blockAlarmByPolicy(alarm, policy, info))
+                    blockedAlarms.push(alarm)
+                  } catch(err) {
+                    log.error(`Failed to block alarm ${alarm.aid} with policy ${policy.pid}: ${err}`)
+                  }
+                })
+                callback(null, policy, blockedAlarms, alreadyExists)
+              } else {
+                callback(null, policy, undefined, alreadyExists)
+              }
 
-                    async(() => {
-                      log.info("Trying to find if any other active alarms are covered by this new policy")
-                      let alarms = await (this.findSimilarAlarmsByPolicy(p, alarm.aid))
-                      if(alarms && alarms.length > 0) {
-                        let blockedAlarms = []
-                        alarms.forEach((alarm) => {
-                          try {
-                            await (this.blockAlarmByPolicy(alarm, policy, info))
-                            blockedAlarms.push(alarm)
-                          } catch(err) {
-                            log.error(`Failed to block alarm ${alarm.aid} with policy ${policy.pid}: ${err}`)
-                          }
-                        })
-                        callback(null, policy, blockedAlarms, alreadyExists)
-                      } else {
-                        callback(null, policy, undefined, alreadyExists)
-                      }
-                    })()
-                  })
-                  .catch((err) => {
-                    callback(err)
-                  })
-
-              }).catch((err) => {
-                callback(err);
-              });
+            })().catch((err) => {
+              callback(err)
+            })                         
           }
         });
       }).catch((err) => {
@@ -908,19 +1119,18 @@ module.exports = class {
           i_target = alarm["p.device.ip"];
           break;
         case "ALARM_BRO_NOTICE":
-          if(alarm["p.noticeType"] && alarm["p.noticeType"] == "SSH::Password_Guessing") {
-            i_type = "ip"
-            i_target = alarm["p.dest.ip"]
-          } else {
-            log.error("Unsupported alarm type for allowing: ", alarm, {})
-            callback(new Error("Unsupported alarm type for allowing: " + alarm.type))
-            return
-          }
-
-          break;
-        default:
           i_type = "ip";
           i_target = alarm["p.dest.ip"];
+          break;
+        default:
+
+          if(alarm["p.dest.name"] ===  alarm["p.dest.ip"]) {
+            i_type = "ip";
+            i_target = alarm["p.dest.ip"];
+          } else {
+            i_type = "dns";
+            i_target = alarm["p.dest.name"];
+          }        
 
           if(userFeedback) {
             switch(userFeedback.type) {
@@ -933,6 +1143,9 @@ module.exports = class {
               i_type = "ip"
               i_target = userFeedback.target
               break
+            case "category":
+              i_type = "category";
+              i_target = userFeedback.target;
             default:
               break
             }
@@ -953,6 +1166,7 @@ module.exports = class {
           aid: alarmID,
           "if.type": i_type,
           "if.target": i_target,
+          category: (userFeedback && userFeedback.category) || ""
         });
 
         switch(i_type) {
@@ -972,9 +1186,18 @@ module.exports = class {
           e["target_name"] = `*.${i_target}`
           e["target_ip"] = alarm["p.dest.ip"];
           break;
+        case "category":
+          e["p.dest.category"] = i_target;
+          e["target_name"] = i_target;
+          e["target_ip"] = alarm["p.dest.ip"];
+          break;
         default:
           // not supported
           break;
+        }
+
+        if(userFeedback && userFeedback.device) {
+          e["p.device.mac"] = userFeedback.device; // limit exception to a single device
         }
 
         log.info("Exception object:", e, {});
@@ -1002,11 +1225,6 @@ module.exports = class {
               
               this.archiveAlarm(alarm.aid)
                 .then(() => {
-                  // old way
-                  if(!info.matchAll) {
-                    callback(null, exception)
-                    return
-                  }
 
                   async(() => {              
                     log.info("Trying to find if any other active alarms are covered by this new exception")
@@ -1135,7 +1353,7 @@ module.exports = class {
   }
 
 
-    enrichDeviceInfo(alarm) {
+    async enrichDeviceInfo(alarm) {
       let deviceIP = alarm["p.device.ip"];
       if(!deviceIP) {
         return Promise.reject(new Error("requiring p.device.ip"));
@@ -1164,7 +1382,7 @@ module.exports = class {
             return;
           }
 
-          let deviceName = dnsManager.name(result);
+          let deviceName = getPreferredBName(result);
           let deviceID = result.mac;
 
           extend(alarm, {
@@ -1179,7 +1397,7 @@ module.exports = class {
       });
     }
 
-    enrichDestInfo(alarm) {
+    async enrichDestInfo(alarm) {
       if(alarm["p.transfer.outbound.size"]) {
         alarm["p.transfer.outbound.humansize"] = formatBytes(alarm["p.transfer.outbound.size"]);
       }
@@ -1190,41 +1408,42 @@ module.exports = class {
 
       let destIP = alarm["p.dest.ip"];
 
-      if(!destIP)
-        return Promise.reject(new Error("Requiring p.dest.ip"));
-
-      const locationAsync = Promise.promisify(im._location).bind(im)
-
-      return async(() => {
-
-        // location
-        const loc = await (locationAsync(destIP))
-        if(loc && loc.loc) {
-          const location = loc.loc;
-          const ll = location.split(",");
-          if(ll.length === 2) {
-            alarm["p.dest.latitude"] = parseFloat(ll[0]);
-            alarm["p.dest.longitude"] = parseFloat(ll[1]);
-          }
-          alarm["p.dest.country"] = loc.country; // FIXME: need complete location info
-        }
-
-        // intel
-        const intel = await (intelTool.getIntel(destIP))
-        if(intel.app) {
-          alarm["p.dest.app"] = intel.app
-        }
-
-        if(intel.category) {
-          alarm["p.dest.category"] = intel.category
-        }
-
-        if(intel.host) {
-          alarm["p.dest.name"] = intel.host
-        }
+      if (!destIP) {
+        return alarm;
+      }
         
-        return alarm
-        
-      })()
-    }
-  }
+      // location
+      const loc = await intelManager.ipinfo(destIP)
+      if (loc && loc.loc) {
+        const location = loc.loc;
+        const ll = location.split(",");
+        if (ll.length === 2) {
+          alarm["p.dest.latitude"] = parseFloat(ll[0]);
+          alarm["p.dest.longitude"] = parseFloat(ll[1]);
+        }
+        alarm["p.dest.country"] = loc.country; // FIXME: need complete location info
+      }
+
+      // intel
+      const intel = await intelTool.getIntel(destIP)
+      if (intel && intel.app) {
+        alarm["p.dest.app"] = intel.app
+      }
+
+      if (intel && intel.category) {
+        alarm["p.dest.category"] = intel.category
+      }
+
+      if (intel && intel.host) {
+        alarm["p.dest.name"] = intel.host
+      } else {
+        alarm["p.dest.name"] = alarm["p.dest.name"] || alarm["p.dest.ip"];
+      }
+      
+      // whois - domain
+      
+      
+      
+      return alarm;
+    }    
+}

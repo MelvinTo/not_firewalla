@@ -17,6 +17,8 @@
 // config.discovery.networkInterface
 
 process.title = "FireMain";
+require('events').EventEmitter.prototype._maxListeners = 100;
+
 let log = require("./logger.js")(__filename);
 
 let sem = require('../sensor/SensorEventManager.js').getInstance();
@@ -27,6 +29,20 @@ log.info("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 const async = require('asyncawait/async');
 const await = require('asyncawait/await');
+
+const fs = require('fs');
+
+function updateTouchFile() {
+  const mainTouchFile = "/dev/shm/main.touch";
+
+  fs.open(mainTouchFile, 'w', (err, fd) => {
+    if(!err) {
+      fs.close(fd, (err2) => {
+
+      })
+    }
+  })
+}
 
 let bone = require("../lib/Bone.js");
 
@@ -39,11 +55,13 @@ let mode = require('./Mode.js')
 // api/main/monitor all depends on sysManager configuration
 var SysManager = require('./SysManager.js');
 var sysManager = new SysManager('info');
-var fs = require('fs');
 var config = JSON.parse(fs.readFileSync(`${__dirname}/config.json`, 'utf8'));
 
 let BoneSensor = require('../sensor/BoneSensor');
 let boneSensor = new BoneSensor();
+
+const fc = require('./config.js')
+const cp = require('child_process')
 
 if(!bone.isAppConnected()) {
   log.info("Waiting for cloud token created by kickstart job...");
@@ -67,7 +85,7 @@ function run0() {
     if(!bone.cloudready()) {
       log.info("Connecting to Firewalla Cloud...");
     } else if(!bone.isAppConnected()) {
-      log.info("Waiting for first app to connect...");
+      log.forceInfo("Waiting for first app to connect...");
     } else if(!sysManager.isConfigInitialized()) {
       log.info("Waiting for configuration setup...");
     }
@@ -75,7 +93,7 @@ function run0() {
     setTimeout(()=>{
       sysManager.update(null);
       run0();
-    },1000);
+    },3000);
   }
 }
 
@@ -88,7 +106,10 @@ process.on('uncaughtException',(err)=>{
   }
   bone.log("error",{version:config.version,type:'FIREWALLA.MAIN.exception',msg:err.message,stack:err.stack},null);
   setTimeout(()=>{
-    require('child_process').execSync("touch /home/pi/.firewalla/managed_reboot")
+    try {
+      require('child_process').execSync("touch /home/pi/.firewalla/managed_reboot")
+    } catch(e) {
+    }
     process.exit(1);
   },1000*5);
 });
@@ -126,6 +147,24 @@ function resetModeInInitStage() {
   })()  
 }
 
+function enableFireBlue() {
+  // start firemain process only in v2 mode
+  cp.exec("sudo systemctl restart firehttpd", (err, stdout, stderr) => {
+    if(err) {
+        log.error("Failed to start firehttpd:", err, {})
+    }
+  })
+}
+
+function disableFireBlue() {
+  // stop firehttpd in v1
+  cp.exec("sudo systemctl stop firehttpd", (err, stdout, stderr) => {
+    if(err) {
+        log.error("Failed to stop firehttpd:", err, {})
+    }
+  })
+}
+
 function run() {
 
   const firewallaConfig = require('../net2/config.js').getConfig();
@@ -143,29 +182,13 @@ function run() {
 
   var BroDetector = require("./BroDetect.js");
   let bd = new BroDetector("bro_detector", config, "info");
+  //bd.enableRecordHitsTimer()
 
   var Discovery = require("./Discovery.js");
   let d = new Discovery("nmap", config, "info");
 
   let SSH = require('../extension/ssh/ssh.js');
   let ssh = new SSH('debug');
-
-  let DNSMASQ = require('../extension/dnsmasq/dnsmasq.js');
-  let dnsmasq = new DNSMASQ();
-  dnsmasq.cleanUpPolicyFilter().then(() => {}).catch(()=>{});
-
-  if (process.env.FWPRODUCTION) {
-    /*
-      ssh.resetRandomPassword((err,password) => {
-      if(err) {
-      log.error("Failed to reset ssh password");
-      } else {
-      log.info("A new random SSH password is used!");
-      sysManager.sshPassword = password;
-      }
-      })
-    */
-  }
 
   // make sure there is at least one usable enternet
   d.discoverInterfaces(function(err, list) {
@@ -198,8 +221,40 @@ function run() {
   var hostManager= new HostManager("cli",'server','debug');
   var os = require('os');
 
-  // always create the secondary interface
-  ModeManager.enableSecondaryInterface();
+  async(() => {
+    // always create the secondary interface
+    await (ModeManager.enableSecondaryInterface())
+    d.discoverInterfaces((err, list) => {
+      if(!err && list && list.length >= 2) {
+        sysManager.update(null) // if new interface is found, update sysManager
+
+        // recreate port direct after secondary interface is created
+        // require('child-process-promise').exec(`${firewalla.getFirewallaHome()}/scripts/prep/05_install_diag_port_redirect.sh`).catch((err) => undefined)
+      }
+    })
+  })()
+
+  let DNSMASQ = require('../extension/dnsmasq/dnsmasq.js');
+  let dnsmasq = new DNSMASQ();
+  dnsmasq.cleanUpFilter('policy').then(() => {}).catch(()=>{});
+
+  if (process.env.FWPRODUCTION) {
+    /*
+      ssh.resetRandomPassword((err,password) => {
+      if(err) {
+      log.error("Failed to reset ssh password");
+      } else {
+      log.info("A new random SSH password is used!");
+      sysManager.sshPassword = password;
+      }
+      })
+    */
+  }
+
+  // Launch PortManager
+
+  let PortForward = require("../extension/portforward/portforward.js");
+  let portforward = new PortForward();
 
   setTimeout(()=> {
     var PolicyManager = require('./PolicyManager.js');
@@ -225,35 +280,56 @@ function run() {
         
         // when mode is changed by anyone else, reapply automatically
         ModeManager.listenOnChange();        
+        await (portforward.start());
       })()     
 
       let PolicyManager2 = require('../alarm/PolicyManager2.js');
       let pm2 = new PolicyManager2();
+      pm2.setupPolicyQueue()
       pm2.registerPolicyEnforcementListener()
 
       setTimeout(() => {
-        pm2.enforceAllPolicies()
-          .then(() => {
-            log.info("All existing policy rules are applied");
-          }).catch((err) => {
-            log.error("Failed to apply some policy rules: ", err, {});
-          });
+        async(() => {
+          await (pm2.cleanupPolicyData())
+          await (pm2.enforceAllPolicies())
+          log.info("========= All existing policy rules are applied =========");
+        })().catch((err) => {
+          log.error("Failed to apply some policy rules: ", err, {});
+        });          
       }, 1000 * 10); // delay for 10 seconds
       require('./UpgradeManager').finishUpgrade();
     });
 
   },1000*2);
 
+  updateTouchFile();
+  
   setInterval(()=>{
+    let memoryUsage = Math.floor(process.memoryUsage().rss / 1000000);
     try {
       if (global.gc) {
         global.gc();
-        log.debug("GC executed, RSS is now", Math.floor(process.memoryUsage().rss / 1000000), "MB", {});
+        log.info("GC executed ",memoryUsage," RSS is now:", Math.floor(process.memoryUsage().rss / 1000000), "MB", {});
       }
     } catch(e) {
     }
-  },1000*60);
+    
+    updateTouchFile();
 
+  },1000*60*5);
+
+  setInterval(()=>{
+    let memoryUsage = Math.floor(process.memoryUsage().rss / 1000000);
+    if (memoryUsage>=100) {
+        try {
+          if (global.gc) {
+            global.gc();
+            log.info("GC executed Protect ",memoryUsage," RSS is now ", Math.floor(process.memoryUsage().rss / 1000000), "MB", {});
+          }
+        } catch(e) {
+        }
+    }
+  },1000*60);
 
 /*
   Bug: when two firewalla's are on the same network, this will change the upnp
@@ -265,7 +341,7 @@ function run() {
     var vpnManager = new VpnManager('info');
     vpnManager.install((err)=>{
       if (err!=null) {
-        log.info("VpnManager:Unable to start vpn");
+        log.info("VpnManager:Unable to start vpn", err);
         hostManager.setPolicy("vpnAvaliable",false);
       } else {
         vpnManager.start((err)=>{
@@ -302,4 +378,34 @@ function run() {
   },20 * 1000);
 
 
+  // finally need to check if firehttpd should be started
+
+  if(fc.isFeatureOn("redirect_httpd")) {
+    enableFireBlue()
+  } else {
+    disableFireBlue()
+  }
+
+  fc.onFeature("redirect_httpd", (feature, status) => {
+    if(feature !== "redirect_httpd") {
+      return
+    }
+
+    if(status) {
+      enableFireBlue()
+    } else {
+      disableFireBlue()
+    }
+  })
+
 }
+
+sem.on("ChangeLogLevel", (event) => {
+  if(event.name && event.level) {
+    if(event.name === "*") {
+      require('./LoggerManager.js').setGlobalLogLevel(event.level);
+    } else {
+      require('./LoggerManager.js').setLogLevel(event.name, event.level);
+    }
+  }
+});

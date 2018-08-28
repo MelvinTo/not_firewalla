@@ -16,12 +16,9 @@
 
 let log = require('./logger.js')(__filename);
 
-let redis = require('redis');
-let rclient = redis.createClient();
+const rclient = require('../util/redis_manager.js').getRedisClient()
 
 let Promise = require('bluebird');
-Promise.promisifyAll(redis.RedisClient.prototype);
-Promise.promisifyAll(redis.Multi.prototype);
 
 let async = require('asyncawait/async');
 let await = require('asyncawait/await');
@@ -272,7 +269,7 @@ class FlowAggrTool {
       let num = tickKeys.length;
 
       if(num <= 0) {
-        log.warn("Nothing to sum for key", sumFlowKey, {});
+        log.debug("Nothing to sum for key", sumFlowKey, {});
 
         // add a placeholder in redis to avoid duplicated queries
         await (rclient.zaddAsync(sumFlowKey, 0, '_'));

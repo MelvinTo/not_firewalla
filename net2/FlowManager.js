@@ -14,30 +14,18 @@
  */
 'use strict';
 let log = require('./logger.js')(__filename);
-var ip = require('ip');
-var os = require('os');
-var network = require('network');
 var stats = require('stats-lite');
 
-var redis = require("redis");
-var rclient = redis.createClient();
+const rclient = require('../util/redis_manager.js').getRedisClient()
 
 let Promise = require('bluebird');
-
-// add promises to all redis functions
-Promise.promisifyAll(redis.RedisClient.prototype);
-Promise.promisifyAll(redis.Multi.prototype);
 
 var DNSManager = require('./DNSManager.js');
 var dnsManager = new DNSManager('info');
 var bone = require("../lib/Bone.js");
 var firewalla = require("../net2/Firewalla.js");
 
-rclient.on("error", function (err) {
-    log.info("Redis(alarm) Error " + err);
-});
-
-var async = require('async');
+const _async = require('async');
 var flowUtil = require('../net2/FlowUtil.js');
 var instance = null;
 
@@ -156,6 +144,8 @@ module.exports = class FlowManager {
         return instance;
     }
 
+    
+
   // use redis hash to store last 24 hours stats
   recordLast24HoursStats(timestamp, downloadBytes, uploadBytes, ip) {
     
@@ -177,7 +167,9 @@ module.exports = class FlowManager {
     let uploadValue = JSON.stringify({bytes: uploadBytes, ts: timestamp});
 
     return rclient.hsetAsync(downloadKey, hourOfDay, downloadValue)
+      .then(rclient.expireAsync(downloadKey, 3600 * 24))
       .then(rclient.hsetAsync(uploadKey, hourOfDay, uploadValue))
+      .then(rclient.expireAsync(uploadKey, 3600 * 24))
       .catch((err) => {
         log.error("Got error when recording last 24 hours stats: " + err);
         throw err;
@@ -303,6 +295,8 @@ module.exports = class FlowManager {
           });
       });
   }
+
+  
   
     // stats are 'hour', 'day'
     // stats:hour:ip_address score=bytes key=_ts-_ts%3600
@@ -323,14 +317,14 @@ module.exports = class FlowManager {
         if (inBytes == null || outBytes == null) {
             return;
         }
- 
+
       rclient.zincrby(inkey,Number(inBytes),subkey,(err,downloadBytes)=>{
         if(err) {
           log.error("Failed to record stats on download bytes: " + err);
           callback(err);
           return;
         }
-        
+
         rclient.zincrby(outkey,Number(outBytes),subkey,(err,uploadBytes)=>{
           if(err) {
             log.error("Failed to record stats on upload bytes: " + err);
@@ -556,7 +550,7 @@ module.exports = class FlowManager {
     // tx here means to outside
     // rx means inside
     getFlowCharacteristics(_flows, direction, minlength, sdv) {
-        log.info("====== Calculating Flow spec of flows", _flows.length, direction, minlength, sdv);
+        log.debug("====== Calculating Flow spec of flows", _flows.length, direction, minlength, sdv);
         if (minlength == null) {
             minlength = 500000;
         }
@@ -636,7 +630,7 @@ module.exports = class FlowManager {
 
         if (flows.length <= 1) {
             // Need to take care of this condition
-            log.info("FlowManager:FlowSummary", "not enough flows");
+            log.debug("FlowManager:FlowSummary", "not enough flows");
             if (flows.length == 1) {
                 flowspec.rxRanked.push(flows[0]);
                 flowspec.txRanked.push(flows[0]);
@@ -760,7 +754,7 @@ module.exports = class FlowManager {
     }
 
     summarizeBytes2(hosts,from,to,block,callback) {
-        async.eachLimit(hosts, 1, (host, cb) => {
+        _async.eachLimit(hosts, 1, (host, cb) => {
             this.summarizeHostBytes(host,from,to,block,(err,data)=>{
                 host.flowsummary = data;
                 cb();
@@ -940,11 +934,11 @@ module.exports = class FlowManager {
                 } else {
                     appdb[flow.appr] = [flow];
                 }
-            } else if (flow.intel && flow.intel.c && flow.intel.c!="intel") {
-                if (activitydb[flow.intel.c]) {
-                    activitydb[flow.intel.c].push(flow);
+            } else if (flow.intel && flow.intel.category && flow.intel.category!="intel") {
+                if (activitydb[flow.intel.category]) {
+                    activitydb[flow.intel.category].push(flow);
                 } else {
-                    activitydb[flow.intel.c] = [flow];
+                    activitydb[flow.intel.category] = [flow];
                 }
             }
         }
@@ -1115,7 +1109,7 @@ module.exports = class FlowManager {
     
     summarizeConnections(ipList, direction, from, to, sortby, hours, resolve, saveStats, callback) {
         let sorted = [];
-        async.each(ipList, (ip, cb) => {
+        _async.each(ipList, (ip, cb) => {
             let key = "flow:conn:" + direction + ":" + ip;
             rclient.zrevrangebyscore([key, from, to,"LIMIT",0,QUERY_MAX_FLOW], (err, result) => {
                 let conndb = {};
@@ -1124,7 +1118,7 @@ module.exports = class FlowManager {
                 let totalOutBytes = 0;
                 if (err == null) {
                     if (result!=null && result.length>0) 
-                        log.info("### Flow:Summarize",key,direction,from,to,sortby,hours,resolve,saveStats,result.length);
+                        log.debug("### Flow:Summarize",key,direction,from,to,sortby,hours,resolve,saveStats,result.length);
                     for (let i in result) {
                         let o = JSON.parse(result[i]);
                         
@@ -1209,7 +1203,7 @@ module.exports = class FlowManager {
                     sorted.forEach(flowTool.trimFlow);                   
                   
                     if (result.length>0) 
-                        log.info("### Flow:Summarize",key,direction,from,to,sortby,hours,resolve,saveStats,result.length,totalInBytes,totalOutBytes);
+                        log.debug("### Flow:Summarize",key,direction,from,to,sortby,hours,resolve,saveStats,result.length,totalInBytes,totalOutBytes);
                     conndb = {};
                     cb();
                 } else {
