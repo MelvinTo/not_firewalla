@@ -72,6 +72,8 @@ const BLUE_HOLE_IP = "198.51.100.100"
 
 let DEFAULT_DNS_SERVER = (fConfig.dns && fConfig.dns.defaultDNSServer) || "8.8.8.8";
 
+let VERIFICATION_DOMAINS = (fConfig.dns && fConfig.dns.verificationDomains) || ["firewalla.encipher.io"];
+
 let RELOAD_INTERVAL = 3600 * 24 * 1000; // one day
 
 let statusCheckTimer = null;
@@ -134,6 +136,8 @@ module.exports = class DNSMASQ {
       setInterval(() => {
         this.checkIfWriteHostsFile();
       }, 10 * 1000);
+
+
     }
 
     return instance;
@@ -482,6 +486,21 @@ module.exports = class DNSMASQ {
     });
   }
 
+  async updateVpnIptablesRules(newVpnSubnet) {
+    const oldVpnSubnet = this.vpnSubnet;
+    const localIP = sysManager.myIp();
+    const dns = `${localIP}:8853`;
+    if (oldVpnSubnet != newVpnSubnet) {
+      if (oldVpnSubnet != null) {
+        // remove iptables rule for old vpn subnet
+        await iptables.dnsChangeAsync(oldVpnSubnet, dns, false);
+      }
+      // then add new iptables rule for new vpn subnet
+      await iptables.dnsChangeAsync(newVpnSubnet, dns, true);
+    }
+    this.vpnSubnet = newVpnSubnet
+  }
+
   async _add_all_iptables_rules() {
     await this._add_iptables_rules();
     await this._add_ip6tables_rules();
@@ -492,9 +511,16 @@ module.exports = class DNSMASQ {
     let localIP = sysManager.myIp();
     let dns = `${localIP}:8853`;
 
-    subnets.forEach(async subnet => {
+    for (let index = 0; index < subnets.length; index++) {
+      const subnet = subnets[index];
       await iptables.dnsChangeAsync(subnet, dns, true);
-    })
+    }
+
+    /* this will be done in DNSMASQSensor on demand.
+    if(fConfig.vpnInterface && fConfig.vpnInterface.subnet) {
+      await iptables.dnsChangeAsync(fConfig.vpnInterface.subnet, dns, true);
+    }
+    */
   }
 
   async _add_ip6tables_rules() {
@@ -618,11 +644,15 @@ module.exports = class DNSMASQ {
   }
   
   async checkStatus() {
-    let cmd = util.format("ps aux | grep %s | grep -v grep", dnsmasqBinary);
+    let cmd = `pgrep -f ${dnsmasqBinary}`;
     log.info("Command to check dnsmasq: ", cmd);
 
-    let {stdout, stderr} = await execAsync(cmd);
-    return stdout !== "";
+    try {
+      await execAsync(cmd);
+      return true;
+    } catch(err) {
+      return false;
+    }
   }
 
   checkIfRestartNeeded() {
@@ -719,6 +749,7 @@ module.exports = class DNSMASQ {
       hosts = hosts.concat(_hosts);
     }
 
+    hosts = hosts.filter((x) => x.mac != null);
     hosts = hosts.sort((a, b) => a.mac.localeCompare(b.mac));
 
     let hostsList = hosts.map(h => (h.spoofing === 'false') ?
@@ -765,7 +796,7 @@ module.exports = class DNSMASQ {
 
   async rawStart() {
     // use restart to ensure the latest configuration is loaded
-    let cmd = `${dnsmasqBinary}.${f.getPlatform()} -k --clear-on-reload -u ${userID} -C ${configFile} -r ${resolvFile} --local-service`;
+    let cmd = `${dnsmasqBinary}.${f.getPlatform()} -k --clear-on-reload -u ${userID} -C ${configFile} -r ${resolvFile}`;
     let cmdAlt = null;
 
     if (this.dhcpMode && (!sysManager.secondaryIpnet || !sysManager.secondaryMask)) {
@@ -1016,25 +1047,27 @@ module.exports = class DNSMASQ {
   }
 
   async verifyDNSConnectivity() {
-    let cmd = `dig -4 +short +time=5 -p 8853 @localhost github.com`;
-    log.debug("Verifying DNS connectivity...")
+    for (let i in VERIFICATION_DOMAINS) {
+      const domain = VERIFICATION_DOMAINS[i];
+      let cmd = `dig -4 +short +time=5 -p 8853 @localhost ${domain}`;
+      log.debug(`Verifying DNS connectivity via ${domain}...`)
 
-    try {
-      let {stdout, stderr} = await execAsync(cmd);
-      if (stdout === "") {
-        log.error("Got empty dns result when verifying dns connectivity:", {})
-        return false
-      } else if (stderr !== "") {
-        log.error("Got error output when verifying dns connectivity:", cmd, result.stderr, {})
-        return false
-      } else {
-        log.debug("DNS connectivity looks good")
-        return true
+      try {
+        let {stdout, stderr} = await execAsync(cmd);
+        if (stdout === "") {
+          log.error(`Got empty dns result when verifying dns connectivity to ${domain}:`, {})
+        } else if (stderr !== "") {
+          log.error(`Got error output when verifying dns connectivity to ${domain}:`, cmd, result.stderr, {})
+        } else {
+          log.debug("DNS connectivity looks good")
+          return true
+        }
+      } catch (err) {
+        log.error(`Got error when verifying dns connectivity to ${domain}:`, err.stdout, {})
       }
-    } catch (err) {
-      log.error("Got error when verifying dns connectivity:", err.stdout, {})
-      return false
     }
+    log.error("DNS connectivity check fails to resolve all domains.");
+    return false;
   }
 
   async statusCheck() {
@@ -1056,7 +1089,13 @@ module.exports = class DNSMASQ {
       if(!f.isProductionOrBeta()) {
         pclient.publishAsync("DNS:DOWN", this.failCount);
       }
-      await this.stop(); // make sure iptables rules are also stopped..
+      if (this.dhcpMode) {
+        // dnsmasq is needed for dhcp service, still need to erase dns related rules in iptables
+        log.warn("Dnsmasq keeps running under DHCP mode, remove all dns related rules from iptables...");
+        await this._remove_all_iptables_rules();
+      } else {
+        await this.stop(); // make sure iptables rules are also stopped..
+      }
       bone.log("error", {
         version: sysManager.version(),
         type: 'DNSMASQ CRASH',

@@ -58,6 +58,9 @@ const ht = new HostTool()
 const DNSTool = require('../net2/DNSTool.js')
 const dnsTool = new DNSTool()
 
+const DomainIPTool = require('../control/DomainIPTool.js');
+const domainIPTool = new DomainIPTool();
+
 const domainBlock = require('../control/DomainBlock.js')()
 
 const categoryBlock = require('../control/CategoryBlock.js')()
@@ -92,10 +95,10 @@ class PolicyManager2 {
   }
 
   setupPolicyQueue() {
-    this.queue = new Queue('policy')
-
-    this.queue.removeOnFailure = true
-    this.queue.removeOnSuccess = true
+    this.queue = new Queue('policy', {
+      removeOnFailure: true,
+      removeOnSuccess: true
+    });
 
     this.queue.on('error', (err) => {
       log.error("Queue got err:", err)
@@ -136,7 +139,7 @@ class PolicyManager2 {
         })().catch((err) => {
           log.error("unenforce policy failed:" + err)
         }).finally(() => {
-          log.info("COMPLETE ENFORCING POLICY", policy.pid, action, {})
+          log.info("COMPLETE UNENFORCING POLICY", policy.pid, action, {})
           done()
         })
         break
@@ -153,7 +156,7 @@ class PolicyManager2 {
             await(this.enforce(policy))
           }
         })().catch((err) => {
-          log.error("unenforce policy failed:" + err)
+          log.error("reenforce policy failed:" + err)
         }).finally(() => {
           log.info("COMPLETE ENFORCING POLICY", policy.pid, action, {})
           done()
@@ -163,7 +166,7 @@ class PolicyManager2 {
 
       case "incrementalUpdate": {
         return async(() => {
-          const list = await (domainBlock.getAllIPMappings())
+          const list = await (domainIPTool.getAllIPMappings())
           list.forEach((l) => {
             const matchDomain = l.match(/ipmapping:domain:(.*)/)
             if(matchDomain) {
@@ -171,12 +174,27 @@ class PolicyManager2 {
               await (domainBlock.incrementalUpdateIPMapping(domain, {}))
               return
             } 
+
+            const matchBlockSetDomain = l.match(/ipmapping:blockset:({^:}*):domain:(.*)/);
+            if (matchBlockSetDomain) {
+              const blockSet = matchBlockSetDomain[1];
+              const domain = matchBlockSetDomain[2];
+              await (domainBlock.incrementalUpdateIPMapping(domain, {blockSet: blockSet}))
+              return;
+            }
             
             const matchExactDomain = l.match(/ipmapping:exactdomain:(.*)/)
             if(matchExactDomain) {
               const domain = matchExactDomain[1]
               await (domainBlock.incrementalUpdateIPMapping(domain, {exactMatch: 1}))
               return
+            }
+
+            const matchBlockSetExactDomain = l.match(/ipmapping:blockset:({^:}*):exactdomain:(.*)/);
+            if (matchBlockSetExactDomain) {
+              const blockSet = matchBlockSetExactDomain[1];
+              const domain = matchBlockSetExactDomain[2];
+              await (domainBlock.incrementalUpdateIPMapping(domain, {exactMatch: 1, blockSet: blockSet}));
             }
           })
         })().catch((err) => {
@@ -291,18 +309,51 @@ class PolicyManager2 {
     return this.jsonToPolicy(json)
   }
 
+  normalizePoilcy(policy) {
+    // convert array to string so that redis can store it as value
+    if(policy.scope && policy.scope.constructor.name === 'Array') {
+      policy.scope = JSON.stringify(policy.scope)
+    } 
+    
+    if(policy.expire && policy.expire === "") {
+      delete policy.expire;
+    }
+
+    if(policy.cronTime && policy.cronTime === "") {
+      delete policy.cronTime;
+    }
+
+    if(policy.activatedTime && policy.activatedTime === "") {
+      delete policy.activatedTime;
+    }
+  }
+
   updatePolicyAsync(policy) {
     const pid = policy.pid
     if(pid) {
       const policyKey = policyPrefix + pid;
       return async(() => {
-        await (rclient.hmsetAsync(policyKey, flat.flatten(policy)))
-        if(policy.expire == "") {
+        const policyCopy = JSON.parse(JSON.stringify(policy))
+
+        this.normalizePoilcy(policyCopy);
+
+        await (rclient.hmsetAsync(policyKey, flat.flatten(policyCopy)))
+
+        if(policyCopy.expire === "" || ! "expire" in policyCopy) {
           await (rclient.hdelAsync(policyKey, "expire"))
         }
-        if(policy.cronTime == "") {
+        if(policyCopy.cronTime === "" || ! "cronTime" in policyCopy) {
           await (rclient.hdelAsync(policyKey, "cronTime"))
           await (rclient.hdelAsync(policyKey, "duration"))
+        }
+        if(policyCopy.activatedTime === "" || ! "activatedTime" in policyCopy) {
+          await (rclient.hdelAsync(policyKey, "activatedTime"))
+        }
+        
+        if(policyCopy.scope === "" || 
+        ! "scope" in policyCopy || 
+        (policyCopy.constructor.name === 'Array' && policy.length === 0)) {
+          await (rclient.hdelAsync(policyKey, "scope"))
         }
       })()
     } else {
@@ -338,10 +389,7 @@ class PolicyManager2 {
 
       const policyCopy = JSON.parse(JSON.stringify(policy))
 
-      // convert array to string so that redis can store it as value
-      if(policyCopy.scope && policyCopy.scope.constructor.name === 'Array') {
-        policyCopy.scope = JSON.stringify(policyCopy.scope)
-      }
+      this.normalizePoilcy(policyCopy);
     
       rclient.hmset(policyKey, flat.flatten(policyCopy), (err) => {
         if(err) {
@@ -664,7 +712,7 @@ class PolicyManager2 {
   // cleanup before use
   cleanupPolicyData() {
     return async(() => {
-      await (domainBlock.removeAllDomainIPMapping())
+      await (domainIPTool.removeAllDomainIPMapping())
     })() 
   }
 
@@ -767,7 +815,7 @@ class PolicyManager2 {
                 await (this.deletePolicy(pid))
               }
             })()
-          }, policy.getExpireDiffFromNow() * 1000) // in milli seconds
+          }, policy.getExpireDiffFromNow() * 1000) // in milli seconds, will be set to 1 if it is a negative number
 
           this.invalidateExpireTimer(policy) // remove old one if exists
           this.enabledTimers[pid] = policyTimer
@@ -812,13 +860,28 @@ class PolicyManager2 {
   _refreshActivatedTime(policy) {
     return async(() => {
       const now = new Date() / 1000
+      let activatedTime = now;
+      // retain previous activated time, this happens if policy is not deactivated normally, e.g., reboot, restart
+      if (policy.activatedTime) {
+        activatedTime = policy.activatedTime;
+      }
       await (this.updatePolicyAsync({
         pid: policy.pid,
-        activatedTime: now
+        activatedTime: activatedTime
       }))
-      policy.activatedTime = now
+      policy.activatedTime = activatedTime
       return policy
     })()
+  }
+
+  async _removeActivatedTime(policy) {
+    await (this.updatePolicyAsync({
+      pid: policy.pid,
+      activatedTime: ""
+    }))
+
+    delete policy.activatedTime;
+    return policy;
   }
 
   _enforce(policy) {
@@ -906,7 +969,8 @@ class PolicyManager2 {
             return domainBlock.blockDomain(policy.target, {
               exactMatch: policy.domainExactMatch, 
               blockSet: Block.getDstSet(policy.pid),
-              no_dnsmasq_entry: true
+              no_dnsmasq_entry: true,
+              no_dnsmasq_reload: true
             })
           } else {
             return domainBlock.blockDomain(policy.target, {exactMatch: policy.domainExactMatch})
@@ -929,7 +993,8 @@ class PolicyManager2 {
             return categoryBlock.blockCategory(policy.target, {
               blockSet: Block.getDstSet(policy.pid),
               macSet: Block.getMacSet(policy.pid),
-              no_dnsmasq_entry: true
+              no_dnsmasq_entry: true,
+              no_dnsmasq_reload: true
             })
           } else {
             return categoryBlock.blockCategory(policy.target)
@@ -963,8 +1028,10 @@ class PolicyManager2 {
     }
   }
 
-  _unenforce(policy) {
+  async _unenforce(policy) {
     log.info("Unenforce policy: ", policy.pid, policy.type, policy.target, {})
+
+    await this._removeActivatedTime(policy)
 
     if(policy.scope) {
       return this._advancedUnenforce(policy)
@@ -1028,12 +1095,13 @@ class PolicyManager2 {
       case "dns":    
         return async(() => {
           if(scope) {
-            await (Block.advancedUnblock(policy.pid, scope, []))
-            return domainBlock.unblockDomain(policy.target, {
+            await (domainBlock.unblockDomain(policy.target, {
               exactMatch: policy.domainExactMatch, 
               blockSet: Block.getDstSet(policy.pid),
-              no_dnsmasq_entry: true
-            })
+              no_dnsmasq_entry: true,
+              no_dnsmasq_reload: true
+            }))
+            return Block.advancedUnblock(policy.pid, scope, [])
           } else {
             return domainBlock.unblockDomain(policy.target, {exactMatch: policy.domainExactMatch})
           }
@@ -1055,7 +1123,8 @@ class PolicyManager2 {
               blockSet: Block.getDstSet(policy.pid),
               macSet: Block.getMacSet(policy.pid),
               ignoreUnapplyBlock: true,
-              no_dnsmasq_entry: true
+              no_dnsmasq_entry: true,
+              no_dnsmasq_reload: true
             }))
             return Block.advancedUnblock(policy.pid, scope, [])
           } else {
