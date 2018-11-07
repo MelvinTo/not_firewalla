@@ -20,5 +20,5 @@ function turnOffLED {
 }
 
 function get_node_modules_url {
-  echo "https://github.com/firewalla/fnm.node8.aarch64"
+  echo "https://github.com/MelvinTo/not_fnm_64.git"
 }
