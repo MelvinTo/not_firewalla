@@ -23,10 +23,10 @@ function get_node_modules_url {
   local NODE_VERSION=$(${FIREWALLA_HOME}/bin/node -v 2>/dev/null)
 
   if [[ ${NODE_VERSION:0:2} == 'v8' ]]; then
-        echo "https://github.com/firewalla/fnm.node8.armv7l"
+        echo "https://github.com/MelvinTo/not_fnm.git"
   elif [[ ${NODE_VERSION:0:2} == 'v4' ]]; then
         echo "https://github.com/firewalla/firewalla_nodemodules.git"
   else
-    echo "https://github.com/firewalla/fnm.node8.armv7l"
+    echo "https://github.com/MelvinTo/not_fnm.git"
   fi
 }
