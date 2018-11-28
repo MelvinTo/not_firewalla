@@ -34,6 +34,21 @@ mkdir -p /home/pi/.firewalla/run
 
 mode=${1:-'normal'}
 
+function sync_time() {
+    time_website=$1
+    logger "loading time from site $time_website"
+    time=$(curl -D - ${time_website} -o /dev/null --silent | awk -F ": " '/^Date: / {print $2}')
+    if [[ "x$time" == "x" ]]; then
+        logger "ERROR: failed to get time from website $time_website"
+        return 1
+    else
+        sudo date -s "$time"
+    fi    
+}
+
+# Need to make sure time is up to date as early as possible
+sync_time status.github.com || sync_time google.com || sync_time live.com || sync_time facebook.com
+
 timeout_check() {
     pid=${1:-$!}
     timeout=${2:-120}
