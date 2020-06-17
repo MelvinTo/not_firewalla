@@ -25,7 +25,7 @@ function turnOffLED {
 }
 
 function get_node_modules_url {
-  echo "https://github.com/firewalla/fnm.node8.aarch64"
+  echo "https://github.com/melvinto/not_fnm_64"
 }
 
 CURRENT_DIR=$(dirname $BASH_SOURCE)
