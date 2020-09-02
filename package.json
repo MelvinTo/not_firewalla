@@ -20,7 +20,7 @@
     "always-tail": "^0.2.0",
     "async": "^2.0.0-rc.5",
     "asyncawait": "1.0.6",
-    "bl": "1.2.0",
+    "bl": "2.2.1",
     "bleno": "https://registry.npmjs.org/bleno/-/bleno-0.4.0.tgz",
     "body-parser": "1.9.x",
     "bonjour": "^3.2.2",
